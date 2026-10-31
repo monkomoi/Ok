@@ -1,0 +1,6 @@
+{
+  "name": "Astra Trader",
+  "description": "Hệ thống giao dịch định lượng & kiểm soát rủi ro Binance USDⓈ-M Futures V5.1 trên Android",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,33 @@
+model_id: "astra_gru_tcn_hybrid_v1"
+architecture: "GRU"
+version: "1.0.0"
+role: "CHAMPION_ON_DEVICE"
+target_device: "Samsung Galaxy S7 Edge (arm64-v8a, 4GB RAM, API 30)"
+input:
+  lookback_length: 64
+  feature_count: 26
+  dtype: "float32"
+network:
+  gru_layers: 1
+  hidden_size: 48
+  dropout: 0.15
+  dense_bottleneck: 32
+  activation: "gelu"
+heads:
+  horizons: ["15m", "1h", "4h"]
+  outputs_per_horizon: 7 # [logit_down, logit_flat, logit_up, expected_ret, q10, q50, q90, raw_sigma]
+training:
+  optimizer: "AdamW"
+  learning_rate: 0.001
+  weight_decay: 0.0005
+  batch_size: 64
+  max_epochs: 35
+  early_stopping_patience: 6
+  loss_weights:
+    classification_ce: 1.0
+    huber_return: 0.5
+    pinball_quantile: 0.5
+    volatility_mse: 0.25
+quantization:
+  mode: "DYNAMIC_RANGE_INT8_AND_FP16"
+  cpu_threads_s7_edge: 2

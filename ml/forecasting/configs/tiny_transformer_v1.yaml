@@ -1,0 +1,21 @@
+model_id: "astra_tiny_transformer_exp_v1"
+architecture: "TINY_CAUSAL_TRANSFORMER"
+version: "1.0.0"
+role: "EXPERIMENTAL_OFFLINE_BENCHMARK_ONLY"
+target_device: "Offline Benchmark (Not Default on S7 Edge unless all 4 gates beat GRU/TCN)"
+input:
+  lookback_length: 64
+  feature_count: 26
+  dtype: "float32"
+network:
+  d_model: 32
+  nhead: 2
+  num_layers: 1
+  dim_feedforward: 64
+  causal_mask: true
+  dropout: 0.20
+heads:
+  horizons: ["15m", "1h", "4h"]
+s7_edge_deployment_policy:
+  allow_default_on_device: false
+  reason: "Higher attention ops/memory overhead and higher overfitting variance on noisy 15m crypto klines compared to compact GRU+TCN."

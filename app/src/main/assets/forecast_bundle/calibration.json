@@ -1,0 +1,51 @@
+{
+  "feature_schema_hash": "d7da74c914044d8b",
+  "horizons": {
+    "15m": {
+      "bias_shift": [
+        -0.13577,
+        -0.00454,
+        0.07706
+      ],
+      "brier_score": 0.1194,
+      "calibrated": true,
+      "ece": 0.00945,
+      "log_loss": 0.6491,
+      "method": "TEMPERATURE_AND_PLATT_PRIOR_SCALING",
+      "min_required_samples": 30,
+      "sample_size": 48,
+      "temperature": 0.4
+    },
+    "1h": {
+      "bias_shift": [
+        -0.0238,
+        -0.1795,
+        0.06276
+      ],
+      "brier_score": 0.12111,
+      "calibrated": true,
+      "ece": 0.04287,
+      "log_loss": 0.65487,
+      "method": "TEMPERATURE_AND_PLATT_PRIOR_SCALING",
+      "min_required_samples": 30,
+      "sample_size": 48,
+      "temperature": 0.6
+    },
+    "4h": {
+      "bias_shift": [
+        -0.0056,
+        -0.5198,
+        0.09395
+      ],
+      "brier_score": 0.10169,
+      "calibrated": true,
+      "ece": 0.08695,
+      "log_loss": 0.54792,
+      "method": "TEMPERATURE_AND_PLATT_PRIOR_SCALING",
+      "min_required_samples": 30,
+      "sample_size": 48,
+      "temperature": 0.6
+    }
+  },
+  "schema_version": "1.0.0"
+}

@@ -1,0 +1,22 @@
+{
+  "architecture": "GRU_TCN_HYBRID_INT8",
+  "fallback_model_id": "astra_logistic_l2_baseline_v1",
+  "feature_count": 26,
+  "feature_schema_hash": "d7da74c914044d8b",
+  "feature_schema_version": "1.0.0",
+  "horizons": [
+    "15m",
+    "1h",
+    "4h"
+  ],
+  "lookback_length": 64,
+  "manifest_version": "1.0.0",
+  "model_id": "astra_gru_tcn_hybrid_v1_int8",
+  "model_tflite_sha256": "d9ed07567bff4feaa40bc681559436a52428b8610747397e861ca248fbfaaa9c",
+  "model_version": "1.0.0-s7edge",
+  "operating_mode": "SHADOW_ADVISORY",
+  "recommended_cpu_threads": 2,
+  "runtime_backend": "CPU_INT8_COMPACT_2THREADS",
+  "target_device": "Samsung Galaxy S7 Edge (arm64-v8a, 4GB RAM, API 30)",
+  "weights_compact_sha256": "cfab03d689ba4ef7664835d1aa470b7954b736615e4391ed31eae836b886a979"
+}

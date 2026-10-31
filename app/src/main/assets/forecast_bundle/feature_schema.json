@@ -1,0 +1,192 @@
+{
+  "base_timeframe": "15m",
+  "clip_z_score": 5.0,
+  "feature_count": 26,
+  "features": [
+    {
+      "formula": "ln(close[t] / close[t-1])",
+      "group": "CORE",
+      "index": 0,
+      "name": "ret_1"
+    },
+    {
+      "formula": "ln(close[t] / close[t-2])",
+      "group": "CORE",
+      "index": 1,
+      "name": "ret_2"
+    },
+    {
+      "formula": "ln(close[t] / close[t-4])",
+      "group": "CORE",
+      "index": 2,
+      "name": "ret_4"
+    },
+    {
+      "formula": "ln(close[t] / close[t-8])",
+      "group": "CORE",
+      "index": 3,
+      "name": "ret_8"
+    },
+    {
+      "formula": "ln(close[t] / close[t-16])",
+      "group": "CORE",
+      "index": 4,
+      "name": "ret_16"
+    },
+    {
+      "formula": "(high[t] - low[t]) / close[t]",
+      "group": "CORE",
+      "index": 5,
+      "name": "hl_range_pct"
+    },
+    {
+      "formula": "(close[t] - open[t]) / open[t]",
+      "group": "CORE",
+      "index": 6,
+      "name": "co_return_pct"
+    },
+    {
+      "formula": "abs(close[t] - open[t]) / max(high[t] - low[t], 1e-8)",
+      "group": "CORE",
+      "index": 7,
+      "name": "body_ratio"
+    },
+    {
+      "formula": "(high[t] - max(open[t], close[t])) / max(high[t] - low[t], 1e-8)",
+      "group": "CORE",
+      "index": 8,
+      "name": "upper_wick_ratio"
+    },
+    {
+      "formula": "(min(open[t], close[t]) - low[t]) / max(high[t] - low[t], 1e-8)",
+      "group": "CORE",
+      "index": 9,
+      "name": "lower_wick_ratio"
+    },
+    {
+      "formula": "(close[t] - ema20[t]) / close[t]",
+      "group": "CORE",
+      "index": 10,
+      "name": "ema20_dist"
+    },
+    {
+      "formula": "(close[t] - ema50[t]) / close[t]",
+      "group": "CORE",
+      "index": 11,
+      "name": "ema50_dist"
+    },
+    {
+      "formula": "(ema20[t] - ema20[t-1]) / ema20[t-1]",
+      "group": "CORE",
+      "index": 12,
+      "name": "ema20_slope"
+    },
+    {
+      "formula": "(rsi14[t] - 50.0) / 50.0",
+      "group": "CORE",
+      "index": 13,
+      "name": "rsi_14_norm"
+    },
+    {
+      "formula": "(ema12[t] - ema26[t] - signal9[t]) / close[t]",
+      "group": "CORE",
+      "index": 14,
+      "name": "macd_hist_pct"
+    },
+    {
+      "formula": "((close[t] - bb_lower20[t]) / max(bb_upper20[t] - bb_lower20[t], 1e-8)) - 0.5",
+      "group": "CORE",
+      "index": 15,
+      "name": "bb_percent_b"
+    },
+    {
+      "formula": "(bb_upper20[t] - bb_lower20[t]) / sma20[t]",
+      "group": "CORE",
+      "index": 16,
+      "name": "bb_width_pct"
+    },
+    {
+      "formula": "atr14[t] / close[t]",
+      "group": "CORE",
+      "index": 17,
+      "name": "atr_14_pct"
+    },
+    {
+      "formula": "ewma_std(ret_1, window=20, lambda=0.94)",
+      "group": "CORE",
+      "index": 18,
+      "name": "ewma_vol_20"
+    },
+    {
+      "formula": "ln(max(volume[t] / sma_vol20[t], 1e-4))",
+      "group": "CORE",
+      "index": 19,
+      "name": "rvol_20"
+    },
+    {
+      "formula": "ln(close_1h[k] / close_1h[k-1]) where closeTime_1h[k] <= closeTime_15m[t]",
+      "group": "CORE",
+      "index": 20,
+      "name": "htf_1h_ret"
+    },
+    {
+      "formula": "ln(close_4h[m] / close_4h[m-1]) where closeTime_4h[m] <= closeTime_15m[t]",
+      "group": "CORE",
+      "index": 21,
+      "name": "htf_4h_ret"
+    },
+    {
+      "formula": "sin(2 * pi * minute_of_day_utc / 1440.0)",
+      "group": "CORE",
+      "index": 22,
+      "name": "tod_sin"
+    },
+    {
+      "formula": "cos(2 * pi * minute_of_day_utc / 1440.0)",
+      "group": "CORE",
+      "index": 23,
+      "name": "tod_cos"
+    },
+    {
+      "formula": "(bid_qty - ask_qty) / max(bid_qty + ask_qty, 1e-8)",
+      "group": "OPTIONAL_MARKET_MICROSTRUCTURE",
+      "index": 24,
+      "name": "order_book_imbalance"
+    },
+    {
+      "formula": "funding_rate * 1000.0",
+      "group": "OPTIONAL_DERIVATIVES",
+      "index": 25,
+      "name": "funding_rate_bps"
+    }
+  ],
+  "higher_timeframes": [
+    "1h",
+    "4h"
+  ],
+  "horizons": [
+    {
+      "bars_15m": 1,
+      "minutes": 15,
+      "name": "15m",
+      "ttl_ms": 900000
+    },
+    {
+      "bars_15m": 4,
+      "minutes": 60,
+      "name": "1h",
+      "ttl_ms": 3600000
+    },
+    {
+      "bars_15m": 16,
+      "minutes": 240,
+      "name": "4h",
+      "ttl_ms": 14400000
+    }
+  ],
+  "lookback_length": 64,
+  "ood_fraction_limit": 0.25,
+  "ood_z_threshold": 3.8,
+  "schema_name": "astra_forecast_feature_schema",
+  "schema_version": "1.0.0"
+}

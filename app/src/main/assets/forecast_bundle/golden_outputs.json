@@ -1,0 +1,198 @@
+{
+  "model_id": "astra_gru_tcn_hybrid_v1_int8",
+  "samples": [
+    {
+      "as_of_close_time_ms": 1710747899999,
+      "horizons": {
+        "15m": {
+          "calibrated_probs": {
+            "pDown": 0.017071,
+            "pFlat": 0.847546,
+            "pUp": 0.135383
+          },
+          "expectedReturnPct": 0.0497,
+          "outOfDistributionScore": 0.0,
+          "predictedVolatilityPct": 0.3583,
+          "q10Pct": -0.4095,
+          "q50Pct": 0.0497,
+          "q90Pct": 0.5089,
+          "raw_logits": [
+            -0.64363,
+            0.78713,
+            -0.028166
+          ],
+          "uncertainty": 0.32464
+        },
+        "1h": {
+          "calibrated_probs": {
+            "pDown": 0.268146,
+            "pFlat": 0.158031,
+            "pUp": 0.573823
+          },
+          "expectedReturnPct": 0.1234,
+          "outOfDistributionScore": 0.0,
+          "predictedVolatilityPct": 0.4912,
+          "q10Pct": -0.5061,
+          "q50Pct": 0.1234,
+          "q90Pct": 0.7529,
+          "raw_logits": [
+            -0.030354,
+            -0.191899,
+            0.339561
+          ],
+          "uncertainty": 0.61708
+        },
+        "4h": {
+          "calibrated_probs": {
+            "pDown": 0.380346,
+            "pFlat": 0.034499,
+            "pUp": 0.585155
+          },
+          "expectedReturnPct": 0.5136,
+          "outOfDistributionScore": 0.0,
+          "predictedVolatilityPct": 0.932,
+          "q10Pct": -0.6808,
+          "q50Pct": 0.5136,
+          "q90Pct": 1.708,
+          "raw_logits": [
+            0.294728,
+            -0.631161,
+            0.453656
+          ],
+          "uncertainty": 0.48327
+        }
+      },
+      "sample_id": "golden_sample_1",
+      "symbol": "DOGEUSDT"
+    },
+    {
+      "as_of_close_time_ms": 1710769499999,
+      "horizons": {
+        "15m": {
+          "calibrated_probs": {
+            "pDown": 0.01174,
+            "pFlat": 0.191626,
+            "pUp": 0.796634
+          },
+          "expectedReturnPct": 0.1667,
+          "outOfDistributionScore": 0.0,
+          "predictedVolatilityPct": 0.4015,
+          "q10Pct": -0.3478,
+          "q50Pct": 0.1667,
+          "q90Pct": 0.6812,
+          "raw_logits": [
+            -0.781024,
+            0.204758,
+            0.693097
+          ],
+          "uncertainty": 0.52347
+        },
+        "1h": {
+          "calibrated_probs": {
+            "pDown": 0.099014,
+            "pFlat": 0.075006,
+            "pUp": 0.82598
+          },
+          "expectedReturnPct": 0.531,
+          "outOfDistributionScore": 0.0,
+          "predictedVolatilityPct": 0.4928,
+          "q10Pct": -0.1005,
+          "q50Pct": 0.531,
+          "q90Pct": 1.1625,
+          "raw_logits": [
+            -0.352717,
+            -0.363634,
+            0.833508
+          ],
+          "uncertainty": 0.44856
+        },
+        "4h": {
+          "calibrated_probs": {
+            "pDown": 0.369726,
+            "pFlat": 0.032899,
+            "pUp": 0.597375
+          },
+          "expectedReturnPct": 0.6864,
+          "outOfDistributionScore": 0.0,
+          "predictedVolatilityPct": 0.9367,
+          "q10Pct": -0.514,
+          "q50Pct": 0.6864,
+          "q90Pct": 1.8868,
+          "raw_logits": [
+            0.28821,
+            -0.649191,
+            0.476529
+          ],
+          "uncertainty": 0.4833
+        }
+      },
+      "sample_id": "golden_sample_2",
+      "symbol": "DOGEUSDT"
+    },
+    {
+      "as_of_close_time_ms": 1710790199999,
+      "horizons": {
+        "15m": {
+          "calibrated_probs": {
+            "pDown": 0.027807,
+            "pFlat": 0.964967,
+            "pUp": 0.007226
+          },
+          "expectedReturnPct": -0.0822,
+          "outOfDistributionScore": 0.0,
+          "predictedVolatilityPct": 0.3152,
+          "q10Pct": -0.4861,
+          "q50Pct": -0.0822,
+          "q90Pct": 0.3217,
+          "raw_logits": [
+            -0.1392,
+            1.148288,
+            -0.891082
+          ],
+          "uncertainty": 0.16418
+        },
+        "1h": {
+          "calibrated_probs": {
+            "pDown": 0.626904,
+            "pFlat": 0.217667,
+            "pUp": 0.155429
+          },
+          "expectedReturnPct": -0.2019,
+          "outOfDistributionScore": 0.0,
+          "predictedVolatilityPct": 0.4984,
+          "q10Pct": -0.8406,
+          "q50Pct": -0.2019,
+          "q90Pct": 0.4368,
+          "raw_logits": [
+            0.507525,
+            0.028529,
+            -0.415801
+          ],
+          "uncertainty": 0.66601
+        },
+        "4h": {
+          "calibrated_probs": {
+            "pDown": 0.305842,
+            "pFlat": 0.074533,
+            "pUp": 0.619625
+          },
+          "expectedReturnPct": 0.7561,
+          "outOfDistributionScore": 0.0,
+          "predictedVolatilityPct": 0.9436,
+          "q10Pct": -0.4532,
+          "q50Pct": 0.7561,
+          "q90Pct": 1.9654,
+          "raw_logits": [
+            0.042355,
+            -0.290543,
+            0.366432
+          ],
+          "uncertainty": 0.55558
+        }
+      },
+      "sample_id": "golden_sample_3",
+      "symbol": "DOGEUSDT"
+    }
+  ],
+  "schema_version": "1.0.0"
+}
