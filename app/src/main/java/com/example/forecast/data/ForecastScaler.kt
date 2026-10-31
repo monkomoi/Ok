@@ -1,109 +1,64 @@
 package com.example.forecast.data
 
-import org.json.JSONObject
+import kotlinx.serialization.Serializable
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToInt
-import kotlin.math.sqrt
 
-/**
- * Applies the frozen training scaler (`scaler.json`) to a `[64, 26]` raw feature sequence
- * and computes the Out-of-Distribution (`OOD`) score identically to `build_features.py`.
- */
+@Serializable
+data class FeatureScalerStats(
+    val index: Int,
+    val name: String,
+    val mean: Double,
+    val std: Double,
+    val median: Double,
+    val iqr: Double,
+    val p01: Double,
+    val p99: Double,
+    val heavyTailed: Boolean,
+    val clipMin: Double,
+    val clipMax: Double
+)
+
+@Serializable
+data class ForecastScalerConfig(
+    val version: String,
+    val scalerHash: String,
+    val stats: List<FeatureScalerStats>
+)
+
 class ForecastScaler(
-    val schemaVersion: String,
-    val scalerType: String,
-    val featureCount: Int,
-    val clipZ: Float,
-    val means: FloatArray,
-    val stds: FloatArray,
-    val medians: FloatArray,
-    val iqrs: FloatArray
+    val config: ForecastScalerConfig
 ) {
+    /**
+     * Scales a raw feature vector in-place or into [outBuffer] with zero heap allocations
+     * when [outBuffer] is pre-allocated. Also returns an OOD (out-of-distribution) score
+     * based on average absolute Z-score excess beyond 3.0 sigma.
+     */
+    fun transformSingleStep(rawFeatures: DoubleArray, outBuffer: FloatArray, outOffset: Int): Double {
+        var oodExcessSum = 0.0
+        val count = min(rawFeatures.size, config.stats.size)
+        for (i in 0 until count) {
+            val st = config.stats[i]
+            val rawVal = rawFeatures[i]
+            val sanitized = if (rawVal.isNaN() || rawVal.isInfinite()) st.median else rawVal
+            val clipped = max(st.clipMin, min(st.clipMax, sanitized))
 
-    data class ScaledSequenceResult(
-        val flattenedScaled: FloatArray,
-        val lastScaledRow: FloatArray,
-        val outOfDistributionScore: Float
-    )
-
-    fun scaleSequenceWindow(
-        rawSequence: Array<FloatArray>,
-        preallocatedOutput: FloatArray? = null
-    ): ScaledSequenceResult {
-        val lookback = rawSequence.size
-        val outSize = lookback * featureCount
-        val flat = if (preallocatedOutput != null && preallocatedOutput.size == outSize) {
-            preallocatedOutput
-        } else {
-            FloatArray(outSize)
-        }
-        val lastScaled = FloatArray(featureCount)
-
-        for (t in 0 until lookback) {
-            val row = rawSequence[t]
-            val baseOffset = t * featureCount
-            for (f in 0 until featureCount) {
-                val z = (row[f].toDouble() - means[f].toDouble()) / max(stds[f].toDouble(), 1e-6)
-                val zClipped = max(-clipZ.toDouble(), min(clipZ.toDouble(), z))
-                // Round to 6 decimals to match Python export parity
-                val rounded = ((zClipped * 1_000_000.0).roundToInt().toDouble() / 1_000_000.0).toFloat()
-                flat[baseOffset + f] = rounded
-                if (t == lookback - 1) {
-                    lastScaled[f] = rounded
-                }
-            }
-        }
-
-        // Compute OOD score on the latest step of the window
-        val lastRaw = rawSequence[lookback - 1]
-        var extremeCount = 0
-        var zSqSum = 0.0
-        for (f in 0 until featureCount) {
-            val rawZ = abs(lastRaw[f].toDouble() - means[f].toDouble()) / max(stds[f].toDouble(), 1e-6)
-            if (rawZ > 3.8) {
-                extremeCount++
-            }
-            val cappedZ = min(rawZ, 10.0)
-            zSqSum += cappedZ * cappedZ
-        }
-        val rmsZ = sqrt(zSqSum / featureCount.toDouble())
-        val extremeFrac = extremeCount.toDouble() / featureCount.toDouble()
-        val rawOod = min(1.0, 0.55 * extremeFrac * 4.0 + 0.45 * max(0.0, (rmsZ - 1.5) / 3.5))
-        val oodScore = ((rawOod * 10_000.0).roundToInt().toDouble() / 10_000.0).toFloat()
-
-        return ScaledSequenceResult(
-            flattenedScaled = flat,
-            lastScaledRow = lastScaled,
-            outOfDistributionScore = oodScore
-        )
-    }
-
-    companion object {
-        fun fromJsonString(jsonStr: String): ForecastScaler {
-            val obj = JSONObject(jsonStr)
-            val count = obj.getInt("feature_count")
-
-            fun parseFloatArray(key: String): FloatArray {
-                val arr = obj.getJSONArray(key)
-                val res = FloatArray(arr.length())
-                for (i in 0 until arr.length()) {
-                    res[i] = arr.getDouble(i).toFloat()
-                }
-                return res
+            val scaled = if (st.heavyTailed) {
+                val denom = if (st.iqr > 1e-8) st.iqr else 1.0
+                (clipped - st.median) / denom
+            } else {
+                val denom = if (st.std > 1e-8) st.std else 1.0
+                (clipped - st.mean) / denom
             }
 
-            return ForecastScaler(
-                schemaVersion = obj.getString("schema_version"),
-                scalerType = obj.getString("scaler_type"),
-                featureCount = count,
-                clipZ = obj.optDouble("clip_z", 5.0).toFloat(),
-                means = parseFloatArray("means"),
-                stds = parseFloatArray("stds"),
-                medians = parseFloatArray("medians"),
-                iqrs = parseFloatArray("iqrs")
-            )
+            val zAbs = abs(scaled)
+            if (zAbs > 3.0) {
+                oodExcessSum += (zAbs - 3.0)
+            }
+            val bounded = max(-5.0, min(5.0, scaled))
+            outBuffer[outOffset + i] = bounded.toFloat()
         }
+        return if (count > 0) oodExcessSum / count.toDouble() else 0.0
     }
 }

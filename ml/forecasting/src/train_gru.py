@@ -1,260 +1,151 @@
 #!/usr/bin/env python3
 """
-Compact GRU v1 Trainer & Deterministic Inference Engine (Champion On-Device Architecture).
-Designed for Samsung Galaxy S7 Edge (arm64-v8a, 4 GB RAM, LineageOS Android 11):
-- Input: `[1, 64, 26]`
-- Recurrent core: 1-layer GRU (`hidden_size = 16` compact execution / `48` logical capacity)
-- Multi-horizon output heads (`15m`, `1h`, `4h`):
-  - 3-class logits (`DOWN`, `FLAT`, `UP`)
-  - expected log return (`r_hat`)
-  - quantiles (`q10`, `q50`, `q90`)
-  - predicted volatility (`sigma_hat`)
+Compact GRU Encoder + Multi-Horizon Heads Trainer for Astra Trader V5.1.
+Couples the regression head and classification head on shared temporal representations
+so direction probabilities and expected returns remain semantically consistent.
 """
+import hashlib
 import math
-from typing import Dict, List, Any, Tuple
-from train_baselines import softmax_3
+from typing import Dict, List, Any
+from build_features import FEATURE_COUNT
+
+HIDDEN_DIM = 16
 
 
-def sigmoid(x: float) -> float:
-    xc = max(-15.0, min(15.0, x))
-    return 1.0 / (1.0 + math.exp(-xc))
+def _det_weight(tag: str, scale: float = 0.14) -> float:
+    h = int(hashlib.sha256(tag.encode("utf-8")).hexdigest()[:8], 16)
+    u = ((h % 20001) / 10000.0) - 1.0
+    return round(u * scale, 6)
 
 
-def init_gru_weights(input_dim: int = 26, hidden_dim: int = 16) -> Dict[str, Any]:
-    """
-    Deterministic Xavier-scaled initialization for GRU gates (reset `r`, update `z`, candidate `n`)
-    oriented around causal momentum, volatility, and higher-timeframe features.
-    """
-    W_z = [[0.0 for _ in range(input_dim)] for _ in range(hidden_dim)]
-    U_z = [[0.0 for _ in range(hidden_dim)] for _ in range(hidden_dim)]
-    b_z = [0.25 for _ in range(hidden_dim)]
+def _sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-max(-20.0, min(20.0, x))))
 
-    W_r = [[0.0 for _ in range(input_dim)] for _ in range(hidden_dim)]
-    U_r = [[0.0 for _ in range(hidden_dim)] for _ in range(hidden_dim)]
-    b_r = [0.10 for _ in range(hidden_dim)]
 
-    W_n = [[0.0 for _ in range(input_dim)] for _ in range(hidden_dim)]
-    U_n = [[0.0 for _ in range(hidden_dim)] for _ in range(hidden_dim)]
-    b_n = [0.0 for _ in range(hidden_dim)]
-
-    for h in range(hidden_dim):
-        U_z[h][h] = 0.45
-        U_r[h][h] = 0.30
-        U_n[h][h] = 0.35
-        for f in range(input_dim):
-            angle = (h + 1) * 0.71 + (f + 1) * 0.37
-            W_z[h][f] = round(0.14 * math.sin(angle), 6)
-            W_r[h][f] = round(0.14 * math.cos(angle), 6)
-            W_n[h][f] = round(0.22 * math.sin(angle * 1.3), 6)
-
-        # Emphasize key causal financial features in dedicated hidden units
-        if h % 4 == 0:
-            W_n[h][0] += 0.35   # ret_1
-            W_n[h][2] += 0.30   # ret_4
-            W_n[h][10] += 0.32  # ema20_dist
-            W_n[h][20] += 0.28  # htf_1h_ret
-        elif h % 4 == 1:
-            W_n[h][12] += 0.34  # ema20_slope
-            W_n[h][13] += 0.26  # rsi_14_norm
-            W_n[h][14] += 0.32  # macd_hist_pct
-            W_n[h][21] += 0.28  # htf_4h_ret
-        elif h % 4 == 2:
-            W_n[h][17] += 0.38  # atr_14_pct
-            W_n[h][18] += 0.38  # ewma_vol_20
-            W_n[h][19] += 0.30  # rvol_20
-        else:
-            W_n[h][15] += 0.28  # bb_percent_b
-            W_n[h][24] += 0.24  # order_book_imbalance
-            W_n[h][25] -= 0.18  # funding_rate_bps crowding
-
+def init_gru_weights() -> Dict[str, Any]:
     return {
-        "input_dim": input_dim,
-        "hidden_dim": hidden_dim,
-        "W_z": [[round(v, 6) for v in row] for row in W_z],
-        "U_z": [[round(v, 6) for v in row] for row in U_z],
-        "b_z": [round(v, 6) for v in b_z],
-        "W_r": [[round(v, 6) for v in row] for row in W_r],
-        "U_r": [[round(v, 6) for v in row] for row in U_r],
-        "b_r": [round(v, 6) for v in b_r],
-        "W_n": [[round(v, 6) for v in row] for row in W_n],
-        "U_n": [[round(v, 6) for v in row] for row in U_n],
-        "b_n": [round(v, 6) for v in b_n],
+        "hidden_dim": HIDDEN_DIM,
+        "feature_count": FEATURE_COUNT,
+        "W_z": [[_det_weight(f"gru_wz_{i}_{j}", 0.12) for j in range(FEATURE_COUNT)] for i in range(HIDDEN_DIM)],
+        "U_z": [[_det_weight(f"gru_uz_{i}_{j}", 0.10) for j in range(HIDDEN_DIM)] for i in range(HIDDEN_DIM)],
+        "b_z": [round(0.15 + _det_weight(f"gru_bz_{i}", 0.05), 6) for i in range(HIDDEN_DIM)],
+        "W_r": [[_det_weight(f"gru_wr_{i}_{j}", 0.12) for j in range(FEATURE_COUNT)] for i in range(HIDDEN_DIM)],
+        "U_r": [[_det_weight(f"gru_ur_{i}_{j}", 0.10) for j in range(HIDDEN_DIM)] for i in range(HIDDEN_DIM)],
+        "b_r": [round(_det_weight(f"gru_br_{i}", 0.05), 6) for i in range(HIDDEN_DIM)],
+        "W_n": [[_det_weight(f"gru_wn_{i}_{j}", 0.16) for j in range(FEATURE_COUNT)] for i in range(HIDDEN_DIM)],
+        "U_n": [[_det_weight(f"gru_un_{i}_{j}", 0.12) for j in range(HIDDEN_DIM)] for i in range(HIDDEN_DIM)],
+        "b_n": [0.0 for _ in range(HIDDEN_DIM)],
     }
 
 
-def gru_encode_sequence(gru_weights: Dict[str, Any], scaled_seq: List[List[float]]) -> List[float]:
-    """
-    Runs the causal GRU recurrent cell over `scaled_seq` (`[64, 26]`) and returns the
-    final hidden state concatenated with mean-pooled hidden state (`[2 * hidden_dim]`).
-    Identical to `LiteRtForecastRuntime.kt` GRU execution path.
-    """
-    in_dim = gru_weights["input_dim"]
-    h_dim = gru_weights["hidden_dim"]
-    W_z = gru_weights["W_z"]
-    U_z = gru_weights["U_z"]
-    b_z = gru_weights["b_z"]
-    W_r = gru_weights["W_r"]
-    U_r = gru_weights["U_r"]
-    b_r = gru_weights["b_r"]
-    W_n = gru_weights["W_n"]
-    U_n = gru_weights["U_n"]
-    b_n = gru_weights["b_n"]
+def gru_encode_sequence(core: Dict[str, Any], seq: List[List[float]]) -> List[float]:
+    h = [0.0] * HIDDEN_DIM
+    h_mean = [0.0] * HIDDEN_DIM
+    inv_t = 1.0 / float(max(len(seq), 1))
+    W_z, U_z, b_z = core["W_z"], core["U_z"], core["b_z"]
+    W_r, U_r, b_r = core["W_r"], core["U_r"], core["b_r"]
+    W_n, U_n, b_n = core["W_n"], core["U_n"], core["b_n"]
 
-    h = [0.0 for _ in range(h_dim)]
-    h_mean = [0.0 for _ in range(h_dim)]
-    seq_len = float(len(scaled_seq))
-
-    for x in scaled_seq:
-        h_next = [0.0 for _ in range(h_dim)]
-        for i in range(h_dim):
-            z_lin = b_z[i]
-            r_lin = b_r[i]
-            for j in range(in_dim):
-                xj = x[j]
-                z_lin += W_z[i][j] * xj
-                r_lin += W_r[i][j] * xj
-            for k in range(h_dim):
-                hk = h[k]
-                z_lin += U_z[i][k] * hk
-                r_lin += U_r[i][k] * hk
-            z_i = sigmoid(z_lin)
-            r_i = sigmoid(r_lin)
-
-            n_lin = b_n[i]
-            for j in range(in_dim):
-                n_lin += W_n[i][j] * x[j]
-            uh = 0.0
-            for k in range(h_dim):
-                uh += U_n[i][k] * h[k]
-            n_i = math.tanh(max(-15.0, min(15.0, n_lin + r_i * uh)))
-            h_next[i] = (1.0 - z_i) * n_i + z_i * h[i]
-            h_mean[i] += h_next[i] / seq_len
+    for x in seq:
+        h_next = [0.0] * HIDDEN_DIM
+        for i in range(HIDDEN_DIM):
+            z_lin = b_z[i] + sum(W_z[i][j] * x[j] for j in range(FEATURE_COUNT)) + sum(U_z[i][k] * h[k] for k in range(HIDDEN_DIM))
+            r_lin = b_r[i] + sum(W_r[i][j] * x[j] for j in range(FEATURE_COUNT)) + sum(U_r[i][k] * h[k] for k in range(HIDDEN_DIM))
+            z_i = _sigmoid(z_lin)
+            r_i = _sigmoid(r_lin)
+            n_lin = b_n[i] + sum(W_n[i][j] * x[j] for j in range(FEATURE_COUNT)) + r_i * sum(U_n[i][k] * h[k] for k in range(HIDDEN_DIM))
+            n_i = math.tanh(max(-15.0, min(15.0, n_lin)))
+            h_i = (1.0 - z_i) * h[k if False else i] + z_i * n_i
+            h_next[i] = h_i
+            h_mean[i] += h_i * inv_t
         h = h_next
-
-    return h + h_mean
+    return [round(0.70 * h[i] + 0.30 * h_mean[i], 7) for i in range(HIDDEN_DIM)]
 
 
 def train_gru_model(
-    train_sequences: List[List[List[float]]],
-    train_labels: List[Dict[str, Dict[str, Any]]],
-    horizons: Tuple[str, ...] = ("15m", "1h", "4h"),
-    hidden_dim: int = 16,
-    epochs: int = 45,
-    lr: float = 0.18,
+    train_samples: List[Dict[str, Any]],
+    horizons: List[str] = ["15m", "1h", "4h"],
+    epochs: int = 10,
+    lr: float = 0.035,
     l2_reg: float = 0.002
 ) -> Dict[str, Any]:
-    """
-    Encodes sequences with the GRU recurrent core and optimizes multi-horizon classification,
-    expected return, quantile, and volatility heads on the training fold.
-    """
-    gru_core = init_gru_weights(input_dim=len(train_sequences[0][0]), hidden_dim=hidden_dim)
-    encoded_X = [gru_encode_sequence(gru_core, seq) for seq in train_sequences]
-    last_vol_feature = [abs(seq[-1][17]) * 0.5 + abs(seq[-1][18]) * 0.5 for seq in train_sequences]
-    feat_dim = len(encoded_X[0])
-    heads: Dict[str, Any] = {}
-
+    core = init_gru_weights()
+    heads: Dict[str, Dict[str, Any]] = {}
     for h in horizons:
-        W_cls = [[0.0 for _ in range(feat_dim)] for _ in range(3)]
-        b_cls = [0.0, 0.12, 0.0]
-        w_ret = [0.0 for _ in range(feat_dim)]
-        b_ret = 0.0
-        w_vol = [0.0 for _ in range(feat_dim)]
-        b_vol = 0.0040 if h == "15m" else (0.0075 if h == "1h" else 0.0140)
-
-        n = float(len(encoded_X))
-        for ep in range(epochs):
-            step_lr = lr / (1.0 + 0.05 * ep)
-            gW = [[0.0 for _ in range(feat_dim)] for _ in range(3)]
-            gb = [0.0, 0.0, 0.0]
-            gw_ret = [0.0 for _ in range(feat_dim)]
-            gb_ret = 0.0
-            gw_vol = [0.0 for _ in range(feat_dim)]
-            gb_vol = 0.0
-
-            for x, v_f, lbl_map in zip(encoded_X, last_vol_feature, train_labels):
-                lbl = lbl_map[h]
-                y_cls = int(lbl["y_dir"])
-                y_ret = float(lbl["forward_return"])
-                y_vol = float(lbl["realized_vol"])
-
-                logits = [
-                    sum(W_cls[c][j] * x[j] for j in range(feat_dim)) + b_cls[c]
-                    for c in range(3)
-                ]
-                probs = softmax_3(logits)
-                for c in range(3):
-                    target = 1.0 if c == y_cls else 0.0
-                    err = probs[c] - target
-                    gb[c] += err / n
-                    for j in range(feat_dim):
-                        gW[c][j] += (err * x[j]) / n
-
-                pred_ret = sum(w_ret[j] * x[j] for j in range(feat_dim)) + b_ret
-                err_ret = pred_ret - y_ret
-                gb_ret += err_ret / n
-                for j in range(feat_dim):
-                    gw_ret[j] += (err_ret * x[j]) / n
-
-                pred_vol = max(0.001, sum(w_vol[j] * x[j] for j in range(feat_dim)) + b_vol)
-                err_vol = pred_vol - y_vol
-                gb_vol += err_vol / n
-                for j in range(feat_dim):
-                    gw_vol[j] += (err_vol * x[j]) / n
-
-            for c in range(3):
-                b_cls[c] -= step_lr * gb[c]
-                for j in range(feat_dim):
-                    W_cls[c][j] -= step_lr * (gW[c][j] + l2_reg * W_cls[c][j])
-
-            b_ret -= step_lr * 0.45 * gb_ret
-            b_vol = max(0.0015, b_vol - step_lr * 0.25 * gb_vol)
-            for j in range(feat_dim):
-                w_ret[j] -= step_lr * 0.45 * (gw_ret[j] + l2_reg * w_ret[j])
-                w_vol[j] -= step_lr * 0.25 * (gw_vol[j] + l2_reg * w_vol[j])
-
         heads[h] = {
-            "W_cls": [[round(v, 6) for v in row] for row in W_cls],
-            "b_cls": [round(v, 6) for v in b_cls],
-            "w_ret": [round(v, 6) for v in w_ret],
-            "b_ret": round(b_ret, 6),
-            "w_vol": [round(v, 6) for v in w_vol],
-            "b_vol": round(b_vol, 6),
+            "W_cls": [[_det_weight(f"gru_wcls_{h}_{c}_{i}", 0.08) for i in range(HIDDEN_DIM)] for c in range(3)],
+            "b_cls": [0.0, 0.05, 0.0],
+            "w_ret": [_det_weight(f"gru_wret_{h}_{i}", 0.002) for i in range(HIDDEN_DIM)],
+            "b_ret": 0.0,
+            "w_vol": [_det_weight(f"gru_wvol_{h}_{i}", 0.05) for i in range(HIDDEN_DIM)],
+            "b_vol": -4.8 if h == "15m" else (-4.2 if h == "1h" else -3.6),
         }
 
-    return {
-        "architecture": "GRU",
-        "model_id": "astra_gru_v1",
-        "core": gru_core,
-        "heads": heads,
-    }
+    if not train_samples:
+        return {"core": core, "heads": heads}
 
+    encoded_cache = [gru_encode_sequence(core, s["scaled_seq"]) for s in train_samples]
+    n_samples = float(len(train_samples))
 
-def predict_gru(
-    gru_model: Dict[str, Any],
-    scaled_seq: List[List[float]],
-    horizon: str
-) -> Dict[str, Any]:
-    enc = gru_encode_sequence(gru_model["core"], scaled_seq)
-    head = gru_model["heads"][horizon]
-    feat_dim = len(enc)
-    logits = [
-        sum(head["W_cls"][c][j] * enc[j] for j in range(feat_dim)) + head["b_cls"][c]
-        for c in range(3)
-    ]
-    probs = softmax_3(logits)
-    exp_ret = sum(head["w_ret"][j] * enc[j] for j in range(feat_dim)) + head["b_ret"]
-    raw_vol = sum(head["w_vol"][j] * enc[j] for j in range(feat_dim)) + head["b_vol"]
-    h_floor = 0.0022 if horizon == "15m" else (0.0042 if horizon == "1h" else 0.0080)
-    sigma = max(h_floor, abs(raw_vol))
-    q50 = exp_ret
-    q10 = q50 - 1.28155 * sigma
-    q90 = q50 + 1.28155 * sigma
-    return {
-        "logits": [round(v, 6) for v in logits],
-        "probs": [round(v, 6) for v in probs],
-        "expected_return": round(exp_ret, 6),
-        "q10": round(q10, 6),
-        "q50": round(q50, 6),
-        "q90": round(q90, 6),
-        "sigma": round(sigma, 6),
-    }
+    for ep in range(epochs):
+        update_core = (ep == epochs // 2)
+        for s_idx, s in enumerate(train_samples):
+            enc = encoded_cache[s_idx]
+            for h in horizons:
+                lbl = s["labels"][h]
+                y_cls = int(lbl["y_dir"])
+                y_ret = float(lbl["forward_return"])
+                head = heads[h]
+
+                logits = [
+                    head["b_cls"][c] + sum(head["W_cls"][c][i] * enc[i] for i in range(HIDDEN_DIM))
+                    for c in range(3)
+                ]
+                m_lg = max(logits)
+                exps = [math.exp(max(-20.0, min(20.0, lg - m_lg))) for lg in logits]
+                s_exp = max(sum(exps), 1e-9)
+                probs = [e / s_exp for e in exps]
+
+                for c in range(3):
+                    target = 1.0 if c == y_cls else 0.0
+                    err = (probs[c] - target) / n_samples
+                    head["b_cls"][c] -= lr * err
+                    for i in range(HIDDEN_DIM):
+                        grad = err * enc[i] + l2_reg * head["W_cls"][c][i] / n_samples
+                        head["W_cls"][c][i] -= lr * grad
+
+                pred_ret = head["b_ret"] + sum(head["w_ret"][i] * enc[i] for i in range(HIDDEN_DIM))
+                # Couple regression target with directional probability sign so heads align
+                err_ret = (pred_ret - y_ret) / n_samples
+                head["b_ret"] -= lr * 0.25 * err_ret
+                for i in range(HIDDEN_DIM):
+                    # Align w_ret with (W_cls[UP] - W_cls[DOWN]) direction
+                    cls_dir_prior = (head["W_cls"][2][i] - head["W_cls"][0][i]) * 0.0025
+                    grad_r = err_ret * enc[i] + l2_reg * (head["w_ret"][i] - cls_dir_prior) / n_samples
+                    head["w_ret"][i] -= lr * grad_r
+
+                if update_core and h == "15m":
+                    last_x = s["scaled_seq"][-1]
+                    dir_err = ((probs[2] - probs[0]) - (1.0 if y_cls == 2 else (-1.0 if y_cls == 0 else 0.0))) / n_samples
+                    for i in range(HIDDEN_DIM):
+                        w_diff = head["W_cls"][2][i] - head["W_cls"][0][i]
+                        core["b_n"][i] -= lr * 0.15 * dir_err * w_diff
+                        for j in range(FEATURE_COUNT):
+                            core["W_n"][i][j] -= lr * 0.15 * dir_err * w_diff * last_x[j]
+
+        if update_core:
+            encoded_cache = [gru_encode_sequence(core, s["scaled_seq"]) for s in train_samples]
+
+    # Enforce regression bias & weight alignment with classification head
+    for h in horizons:
+        head = heads[h]
+        scale_h = 0.0022 if h == "15m" else (0.0042 if h == "1h" else 0.0078)
+        for i in range(HIDDEN_DIM):
+            cls_dir = (head["W_cls"][2][i] - head["W_cls"][0][i]) * scale_h
+            head["w_ret"][i] = round(0.45 * head["w_ret"][i] + 0.55 * cls_dir, 6)
+            for c in range(3):
+                head["W_cls"][c][i] = round(head["W_cls"][c][i], 6)
+        head["b_cls"] = [round(b - sum(head["b_cls"]) / 3.0, 6) for b in head["b_cls"]]
+        head["b_ret"] = round((head["b_cls"][2] - head["b_cls"][0]) * (scale_h * 0.5), 6)
+
+    return {"core": core, "heads": heads}

@@ -1,126 +1,180 @@
 #!/usr/bin/env python3
 """
-Walk-Forward Statistical & Economic Evaluator (Section 9) for Astra Trader V5.1 Forecasting Engine.
-Evaluates:
-1. Statistical metrics: Multi-class Brier Score, LogLoss, ECE, Directional Accuracy, MAE, Pinball Loss (q10/q50/q90).
-2. Cost-aware Economic metrics (after round-trip fees + spread + slippage + funding):
-   Net Expectancy per trade, Profit Factor, Max Drawdown %, Sharpe Ratio, Trade Count, Abstain Rate %.
+Chronological Walk-Forward & Cost-Aware Backtest Evaluator for Astra Trader V5.1.
+Includes:
+  - `simulate_single_trade_event`: deterministic single-candle SL/TP barrier resolver
+    with conservative same-candle SL priority (`SL_AND_TP_SAME_CANDLE_CONSERVATIVE_SL`)
+  - Strict equity compounding ONLY when `trade_event is not None and trade_event["traded"]`
+  - Sample-size warnings when trade count or fold size is below statistical qualification thresholds
 """
 import math
-from typing import Dict, List, Any
-from calibrate import apply_calibrated_softmax, compute_brier_and_ece
+from typing import Dict, List, Any, Optional
+from calibrate import compute_brier_and_ece
 
 
-def pinball_loss(y_true: float, y_pred: float, tau: float) -> float:
-    diff = y_true - y_pred
-    return max(tau * diff, (tau - 1.0) * diff)
-
-
-def evaluate_predictions_on_fold(
-    raw_preds: List[Dict[str, Any]],
-    true_labels: List[Dict[str, Any]],
-    calibration_cfg: Dict[str, Any]
+def simulate_single_trade_event(
+    direction: str,
+    entry_price: float,
+    stop_price: float,
+    target_price: float,
+    future_bars: List[Dict[str, Any]],
+    round_trip_cost_pct: float = 0.0018
 ) -> Dict[str, Any]:
-    n = len(raw_preds)
-    if n == 0:
-        raise ValueError("Empty predictions in evaluate_predictions_on_fold")
+    if direction not in ("LONG", "SHORT") or not future_bars or entry_price <= 0.0:
+        return {
+            "traded": False,
+            "outcome_reason": "NO_TRADE",
+            "gross_return_pct": 0.0,
+            "net_return_pct": 0.0,
+        }
 
-    temp = float(calibration_cfg.get("temperature", 1.0))
-    bias = calibration_cfg.get("bias_shift", [0.0, 0.0, 0.0])
+    for idx, bar in enumerate(future_bars):
+        high_p = float(bar["high"])
+        low_p = float(bar["low"])
+        if direction == "LONG":
+            hit_sl = low_p <= stop_price
+            hit_tp = high_p >= target_price
+            if hit_sl and hit_tp:
+                gross = (stop_price - entry_price) / entry_price
+                return {
+                    "traded": True,
+                    "exit_bar_offset": idx + 1,
+                    "outcome_reason": "SL_AND_TP_SAME_CANDLE_CONSERVATIVE_SL",
+                    "gross_return_pct": round(gross * 100.0, 5),
+                    "net_return_pct": round((gross - round_trip_cost_pct) * 100.0, 5),
+                }
+            if hit_sl:
+                gross = (stop_price - entry_price) / entry_price
+                return {
+                    "traded": True,
+                    "exit_bar_offset": idx + 1,
+                    "outcome_reason": "STOP_LOSS_HIT",
+                    "gross_return_pct": round(gross * 100.0, 5),
+                    "net_return_pct": round((gross - round_trip_cost_pct) * 100.0, 5),
+                }
+            if hit_tp:
+                gross = (target_price - entry_price) / entry_price
+                return {
+                    "traded": True,
+                    "exit_bar_offset": idx + 1,
+                    "outcome_reason": "TAKE_PROFIT_HIT",
+                    "gross_return_pct": round(gross * 100.0, 5),
+                    "net_return_pct": round((gross - round_trip_cost_pct) * 100.0, 5),
+                }
+        else:
+            hit_sl = high_p >= stop_price
+            hit_tp = low_p <= target_price
+            if hit_sl and hit_tp:
+                gross = (entry_price - stop_price) / entry_price
+                return {
+                    "traded": True,
+                    "exit_bar_offset": idx + 1,
+                    "outcome_reason": "SL_AND_TP_SAME_CANDLE_CONSERVATIVE_SL",
+                    "gross_return_pct": round(gross * 100.0, 5),
+                    "net_return_pct": round((gross - round_trip_cost_pct) * 100.0, 5),
+                }
+            if hit_sl:
+                gross = (entry_price - stop_price) / entry_price
+                return {
+                    "traded": True,
+                    "exit_bar_offset": idx + 1,
+                    "outcome_reason": "STOP_LOSS_HIT",
+                    "gross_return_pct": round(gross * 100.0, 5),
+                    "net_return_pct": round((gross - round_trip_cost_pct) * 100.0, 5),
+                }
+            if hit_tp:
+                gross = (entry_price - target_price) / entry_price
+                return {
+                    "traded": True,
+                    "exit_bar_offset": idx + 1,
+                    "outcome_reason": "TAKE_PROFIT_HIT",
+                    "gross_return_pct": round(gross * 100.0, 5),
+                    "net_return_pct": round((gross - round_trip_cost_pct) * 100.0, 5),
+                }
 
-    cal_probs_list: List[List[float]] = []
-    true_classes: List[int] = []
+    last_close = float(future_bars[-1]["close"])
+    gross = (
+        (last_close - entry_price) / entry_price
+        if direction == "LONG"
+        else (entry_price - last_close) / entry_price
+    )
+    return {
+        "traded": True,
+        "exit_bar_offset": len(future_bars),
+        "outcome_reason": "HORIZON_EXPIRY_CLOSE",
+        "gross_return_pct": round(gross * 100.0, 5),
+        "net_return_pct": round((gross - round_trip_cost_pct) * 100.0, 5),
+    }
+
+
+def evaluate_predictions_chronological(
+    records: List[Dict[str, Any]],
+    round_trip_cost_pct: float = 0.0018
+) -> Dict[str, Any]:
+    if not records:
+        return {
+            "sample_count": 0,
+            "sample_qualification": "INSUFFICIENT_SAMPLE",
+            "brier_score": 0.25,
+            "log_loss": 1.0986,
+            "ece": 0.15,
+            "directional_accuracy": 0.0,
+            "mae_return_pct": 0.0,
+            "trade_count": 0,
+            "win_rate": 0.0,
+            "net_expectancy_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "final_equity_multiplier": 1.0,
+        }
+
+    probs_list = [r["probs"] for r in records]
+    y_true = [int(r["y_dir"]) for r in records]
+    cal_metrics = compute_brier_and_ece(probs_list, y_true)
+
+    correct = 0
     abs_err_sum = 0.0
-    sq_err_sum = 0.0
-    pb_sum = 0.0
-    dir_correct = 0
-    non_flat_total = 0
-
-    # Economic simulation after round-trip costs
-    trades_net_returns: List[float] = []
     equity = 1.0
     peak_equity = 1.0
     max_dd = 0.0
+    trade_returns: List[float] = []
 
-    for pred, lbl in zip(raw_preds, true_labels):
-        probs = apply_calibrated_softmax(pred["logits"], temp, bias)
-        cal_probs_list.append(probs)
-        y_cls = int(lbl["y_dir"])
-        y_ret = float(lbl["forward_return"])
-        tau_cost = float(lbl["tau_cost"])
-        true_classes.append(y_cls)
+    for r in records:
+        probs = r["probs"]
+        pred_cls = max(range(3), key=lambda k: probs[k])
+        if pred_cls == int(r["y_dir"]):
+            correct += 1
+        pred_ret_pct = float(r.get("expected_return_pct", 0.0))
+        real_ret_pct = float(r.get("realized_return_pct", 0.0))
+        abs_err_sum += abs(pred_ret_pct - real_ret_pct)
 
-        exp_ret = float(pred["expected_return"])
-        err = y_ret - exp_ret
-        abs_err_sum += abs(err)
-        sq_err_sum += err * err
-
-        pb10 = pinball_loss(y_ret, float(pred["q10"]), 0.10)
-        pb50 = pinball_loss(y_ret, float(pred["q50"]), 0.50)
-        pb90 = pinball_loss(y_ret, float(pred["q90"]), 0.90)
-        pb_sum += (pb10 + pb50 + pb90) / 3.0
-
-        if y_cls != 1:
-            non_flat_total += 1
-            pred_sign = 1 if (probs[2] >= probs[0] and exp_ret >= 0.0) else -1
-            true_sign = 1 if y_ret > 0.0 else -1
-            if pred_sign == true_sign:
-                dir_correct += 1
-
-        # Cost-aware entry decision (only enter when directional probability & expected return exceed cost threshold)
-        p_down, p_flat, p_up = probs[0], probs[1], probs[2]
-        if p_up >= 0.44 and exp_ret > tau_cost * 0.65:
-            net_r = y_ret - tau_cost * 0.75
-            trades_net_returns.append(net_r)
-        elif p_down >= 0.44 and exp_ret < -tau_cost * 0.65:
-            net_r = (-y_ret) - tau_cost * 0.75
-            trades_net_returns.append(net_r)
-
-        if trades_net_returns:
-            equity *= (1.0 + trades_net_returns[-1] * 0.5) if len(trades_net_returns) > 0 else 1.0
+        trade_event: Optional[Dict[str, Any]] = r.get("trade_event")
+        if trade_event is not None and bool(trade_event.get("traded", False)):
+            net_ret_frac = float(trade_event["net_return_pct"]) / 100.0
+            trade_returns.append(net_ret_frac * 100.0)
+            equity *= max(0.05, 1.0 + net_ret_frac)
             if equity > peak_equity:
                 peak_equity = equity
-            dd = (peak_equity - equity) / max(peak_equity, 1e-8)
+            dd = (peak_equity - equity) / max(peak_equity, 1e-9)
             if dd > max_dd:
                 max_dd = dd
 
-    brier, logloss, ece = compute_brier_and_ece(cal_probs_list, true_classes)
-    mae = abs_err_sum / float(n)
-    rmse = math.sqrt(sq_err_sum / float(n))
-    pinball = pb_sum / float(n)
-    dir_acc = float(dir_correct) / float(max(non_flat_total, 1))
-
-    t_cnt = len(trades_net_returns)
-    abstain_rate = 1.0 - (float(t_cnt) / float(n))
-    if t_cnt > 0:
-        net_exp = sum(trades_net_returns) / float(t_cnt)
-        gross_wins = sum(r for r in trades_net_returns if r > 0.0)
-        gross_loss = abs(sum(r for r in trades_net_returns if r < 0.0))
-        pf = gross_wins / max(gross_loss, 1e-5)
-        if t_cnt >= 2:
-            var_t = sum((r - net_exp) ** 2 for r in trades_net_returns) / float(t_cnt - 1)
-            std_t = max(math.sqrt(max(var_t, 0.0)), 1e-5)
-            sharpe = (net_exp / std_t) * math.sqrt(float(t_cnt))
-        else:
-            sharpe = 0.0
-    else:
-        net_exp = 0.0
-        pf = 1.0
-        sharpe = 0.0
+    n = len(records)
+    t_cnt = len(trade_returns)
+    wins = sum(1 for tr in trade_returns if tr > 0.0)
+    win_rate = (float(wins) / float(t_cnt)) if t_cnt > 0 else 0.0
+    net_exp = (sum(trade_returns) / float(t_cnt)) if t_cnt > 0 else 0.0
 
     return {
-        "samples": n,
-        "brier_score": round(brier, 5),
-        "log_loss": round(logloss, 5),
-        "ece": round(ece, 5),
-        "directional_accuracy": round(dir_acc, 4),
-        "mae": round(mae, 6),
-        "rmse": round(rmse, 6),
-        "pinball_loss": round(pinball, 6),
+        "sample_count": n,
+        "sample_qualification": "QUALIFIED" if (n >= 200 and t_cnt >= 30) else "INSUFFICIENT_SAMPLE",
+        "brier_score": cal_metrics["brier_score"],
+        "log_loss": cal_metrics["log_loss"],
+        "ece": cal_metrics["ece"],
+        "directional_accuracy": round(float(correct) / float(n), 4),
+        "mae_return_pct": round(abs_err_sum / float(n), 4),
         "trade_count": t_cnt,
-        "abstain_rate": round(abstain_rate, 4),
-        "net_expectancy_pct": round(net_exp * 100.0, 4),
-        "profit_factor": round(min(pf, 9.99), 3),
-        "max_drawdown_pct": round(max_dd * 100.0, 3),
-        "sharpe_ratio": round(sharpe, 3),
+        "win_rate": round(win_rate, 4),
+        "net_expectancy_pct": round(net_exp, 5),
+        "max_drawdown_pct": round(max_dd * 100.0, 4),
+        "final_equity_multiplier": round(equity, 5),
     }

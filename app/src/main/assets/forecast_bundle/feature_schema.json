@@ -2,162 +2,163 @@
   "base_timeframe": "15m",
   "clip_z_score": 5.0,
   "feature_count": 26,
+  "feature_schema_hash": "1afb18e49d6fe357",
   "features": [
     {
-      "formula": "ln(close[t] / close[t-1])",
-      "group": "CORE",
+      "formula": "ln(C_t / C_{t-1})",
+      "group": "PRICE_RETURNS",
       "index": 0,
-      "name": "ret_1"
+      "name": "ret_15m_1"
     },
     {
-      "formula": "ln(close[t] / close[t-2])",
-      "group": "CORE",
+      "formula": "ln(C_t / C_{t-2})",
+      "group": "PRICE_RETURNS",
       "index": 1,
-      "name": "ret_2"
+      "name": "ret_15m_2"
     },
     {
-      "formula": "ln(close[t] / close[t-4])",
-      "group": "CORE",
+      "formula": "ln(C_t / C_{t-4})",
+      "group": "PRICE_RETURNS",
       "index": 2,
-      "name": "ret_4"
+      "name": "ret_15m_4"
     },
     {
-      "formula": "ln(close[t] / close[t-8])",
-      "group": "CORE",
+      "formula": "ln(C_t / C_{t-8})",
+      "group": "PRICE_RETURNS",
       "index": 3,
-      "name": "ret_8"
+      "name": "ret_15m_8"
     },
     {
-      "formula": "ln(close[t] / close[t-16])",
-      "group": "CORE",
+      "formula": "ln(C1h_t / C1h_{t-1})",
+      "group": "HIGHER_TF_CONTEXT",
       "index": 4,
-      "name": "ret_16"
+      "name": "ret_1h_1"
     },
     {
-      "formula": "(high[t] - low[t]) / close[t]",
-      "group": "CORE",
+      "formula": "ln(C4h_t / C4h_{t-1})",
+      "group": "HIGHER_TF_CONTEXT",
       "index": 5,
+      "name": "ret_4h_1"
+    },
+    {
+      "formula": "(H_t - L_t) / C_t",
+      "group": "VOLATILITY",
+      "index": 6,
       "name": "hl_range_pct"
     },
     {
-      "formula": "(close[t] - open[t]) / open[t]",
-      "group": "CORE",
-      "index": 6,
-      "name": "co_return_pct"
-    },
-    {
-      "formula": "abs(close[t] - open[t]) / max(high[t] - low[t], 1e-8)",
-      "group": "CORE",
+      "formula": "(C_t - O_t) / max(H_t - L_t, eps)",
+      "group": "CANDLE_GEOMETRY",
       "index": 7,
-      "name": "body_ratio"
+      "name": "body_to_range"
     },
     {
-      "formula": "(high[t] - max(open[t], close[t])) / max(high[t] - low[t], 1e-8)",
-      "group": "CORE",
+      "formula": "(H_t - max(O_t, C_t)) / max(H_t - L_t, eps)",
+      "group": "CANDLE_GEOMETRY",
       "index": 8,
       "name": "upper_wick_ratio"
     },
     {
-      "formula": "(min(open[t], close[t]) - low[t]) / max(high[t] - low[t], 1e-8)",
-      "group": "CORE",
+      "formula": "(min(O_t, C_t) - L_t) / max(H_t - L_t, eps)",
+      "group": "CANDLE_GEOMETRY",
       "index": 9,
       "name": "lower_wick_ratio"
     },
     {
-      "formula": "(close[t] - ema20[t]) / close[t]",
-      "group": "CORE",
+      "formula": "ATR_14 / C_t",
+      "group": "VOLATILITY",
       "index": 10,
-      "name": "ema20_dist"
+      "name": "atr_pct_14"
     },
     {
-      "formula": "(close[t] - ema50[t]) / close[t]",
-      "group": "CORE",
+      "formula": "std(ret_15m, 16)",
+      "group": "VOLATILITY",
       "index": 11,
-      "name": "ema50_dist"
+      "name": "realized_vol_16"
     },
     {
-      "formula": "(ema20[t] - ema20[t-1]) / ema20[t-1]",
-      "group": "CORE",
+      "formula": "ewma_std(ret_15m, lambda=0.90)",
+      "group": "VOLATILITY",
       "index": 12,
-      "name": "ema20_slope"
+      "name": "ewma_vol_16"
     },
     {
-      "formula": "(rsi14[t] - 50.0) / 50.0",
-      "group": "CORE",
+      "formula": "(C_t - EMA20_15m) / C_t",
+      "group": "TREND_MOMENTUM",
       "index": 13,
+      "name": "ema20_dist_pct"
+    },
+    {
+      "formula": "(C_t - EMA50_15m) / C_t",
+      "group": "TREND_MOMENTUM",
+      "index": 14,
+      "name": "ema50_dist_pct"
+    },
+    {
+      "formula": "(EMA20_t - EMA20_{t-1}) / C_t",
+      "group": "TREND_MOMENTUM",
+      "index": 15,
+      "name": "ema20_slope_pct"
+    },
+    {
+      "formula": "(EMA20_1h - EMA50_1h) / C1h_t",
+      "group": "HIGHER_TF_CONTEXT",
+      "index": 16,
+      "name": "ema20_50_spread_1h"
+    },
+    {
+      "formula": "(RSI_14 - 50.0) / 50.0",
+      "group": "TREND_MOMENTUM",
+      "index": 17,
       "name": "rsi_14_norm"
     },
     {
-      "formula": "(ema12[t] - ema26[t] - signal9[t]) / close[t]",
-      "group": "CORE",
-      "index": 14,
-      "name": "macd_hist_pct"
-    },
-    {
-      "formula": "((close[t] - bb_lower20[t]) / max(bb_upper20[t] - bb_lower20[t], 1e-8)) - 0.5",
-      "group": "CORE",
-      "index": 15,
-      "name": "bb_percent_b"
-    },
-    {
-      "formula": "(bb_upper20[t] - bb_lower20[t]) / sma20[t]",
-      "group": "CORE",
-      "index": 16,
-      "name": "bb_width_pct"
-    },
-    {
-      "formula": "atr14[t] / close[t]",
-      "group": "CORE",
-      "index": 17,
-      "name": "atr_14_pct"
-    },
-    {
-      "formula": "ewma_std(ret_1, window=20, lambda=0.94)",
-      "group": "CORE",
+      "formula": "(C_t - Low20) / max(High20 - Low20, eps) - 0.5",
+      "group": "STRUCTURE",
       "index": 18,
-      "name": "ewma_vol_20"
+      "name": "breakout_pos_20"
     },
     {
-      "formula": "ln(max(volume[t] / sma_vol20[t], 1e-4))",
-      "group": "CORE",
+      "formula": "V_t / max(mean(V, 20), eps) - 1.0",
+      "group": "VOLUME_LIQUIDITY",
       "index": 19,
       "name": "rvol_20"
     },
     {
-      "formula": "ln(close_1h[k] / close_1h[k-1]) where closeTime_1h[k] <= closeTime_15m[t]",
-      "group": "CORE",
+      "formula": "(QV_t - mean(QV, 20)) / max(std(QV, 20), eps)",
+      "group": "VOLUME_LIQUIDITY",
       "index": 20,
-      "name": "htf_1h_ret"
-    },
-    {
-      "formula": "ln(close_4h[m] / close_4h[m-1]) where closeTime_4h[m] <= closeTime_15m[t]",
-      "group": "CORE",
-      "index": 21,
-      "name": "htf_4h_ret"
-    },
-    {
-      "formula": "sin(2 * pi * minute_of_day_utc / 1440.0)",
-      "group": "CORE",
-      "index": 22,
-      "name": "tod_sin"
-    },
-    {
-      "formula": "cos(2 * pi * minute_of_day_utc / 1440.0)",
-      "group": "CORE",
-      "index": 23,
-      "name": "tod_cos"
-    },
-    {
-      "formula": "(bid_qty - ask_qty) / max(bid_qty + ask_qty, 1e-8)",
-      "group": "OPTIONAL_MARKET_MICROSTRUCTURE",
-      "index": 24,
-      "name": "order_book_imbalance"
+      "name": "quote_vol_z20"
     },
     {
       "formula": "funding_rate * 1000.0",
-      "group": "OPTIONAL_DERIVATIVES",
+      "group": "FUTURES_MICROSTRUCTURE",
+      "index": 21,
+      "name": "funding_rate_scaled"
+    },
+    {
+      "formula": "spread_bps / 10.0",
+      "group": "FUTURES_MICROSTRUCTURE",
+      "index": 22,
+      "name": "spread_bps_norm"
+    },
+    {
+      "formula": "(bid_qty - ask_qty) / max(bid_qty + ask_qty, eps)",
+      "group": "FUTURES_MICROSTRUCTURE",
+      "index": 23,
+      "name": "obi_top_book"
+    },
+    {
+      "formula": "(mark - index) / index * 10000 / 10.0",
+      "group": "FUTURES_MICROSTRUCTURE",
+      "index": 24,
+      "name": "mark_index_basis_bps"
+    },
+    {
+      "formula": "0.5 * sin(2pi * hour / 24) + 0.5 * cos(2pi * dow / 7)",
+      "group": "TEMPORAL",
       "index": 25,
-      "name": "funding_rate_bps"
+      "name": "tod_sin_cos_blend"
     }
   ],
   "higher_timeframes": [
@@ -186,7 +187,7 @@
   ],
   "lookback_length": 64,
   "ood_fraction_limit": 0.25,
-  "ood_z_threshold": 3.8,
-  "schema_name": "astra_forecast_feature_schema",
+  "ood_z_threshold": 4.0,
+  "schema_name": "astra_futures_multitf_v1",
   "schema_version": "1.0.0"
 }

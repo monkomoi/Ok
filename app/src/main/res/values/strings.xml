@@ -1,13 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Astra Trader</string>
-    <string name="tab_overview">Tổng quan</string>
-    <string name="tab_strategy">Chiến lược</string>
-    <string name="tab_api">API &amp; Tích hợp</string>
-    <string name="tab_history">Lịch sử</string>
-    <string name="tab_logs">Nhật ký</string>
-    <string name="service_notification_title">Astra Trader V5.1 · Định lượng &amp; Rủi ro</string>
-    <string name="service_notification_text">Đang giám sát luồng dữ liệu, vị thế và đối soát lệnh</string>
-    <string name="disclaimer_no_guarantee">Không mô hình nào bảo đảm lợi nhuận. Stop-market vẫn có thể trượt giá; tiến trình Android có thể bị hệ điều hành dừng khi thiếu RAM hoặc mất mạng.</string>
-    <string name="connectivity_lost_title">MẤT KẾT NỐI INTERNET · TẠM DỪNG GỬI LỆNH MỚI</string>
-    <string name="connectivity_recheck_button">Kiểm tra lại</string>
+    <string name="nav_overview">Tổng quan</string>
+    <string name="nav_api_integration">API &amp; Tích hợp</string>
+    <string name="nav_strategy_risk">Chiến lược &amp; Rủi ro</string>
+    <string name="nav_history_analytics">Lịch sử &amp; Phân tích</string>
+    <string name="nav_system_logs">Nhật ký hệ thống</string>
 </resources>

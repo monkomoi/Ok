@@ -1,146 +1,242 @@
 package com.example.forecast.engine
 
-import com.example.domain.TradeSide
+import com.example.domain.SymbolModelEligibility
+import com.example.forecast.domain.ForecastModelBundle
 import com.example.forecast.domain.ForecastOperatingMode
 import com.example.forecast.domain.ForecastStatus
-import java.math.BigDecimal
-import java.math.RoundingMode
+import com.example.forecast.domain.ForecastTensorInput
+import com.example.forecast.domain.HorizonForecast
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+
+data class QualityGateDecision(
+    val status: ForecastStatus,
+    val statusReason: String,
+    val compositeDirectionalScore: Double,
+    val compositeConfidence: Double,
+    val uncertaintyScore: Double,
+    val headConsistent: Boolean,
+    val positionSizingMultiplier: Double,
+    val allowTradeExecution: Boolean
+)
 
 /**
- * Cost-Aware Forecast Quality Gate (`ForecastQualityGate.kt`, Section 6.2 & 12).
- * - Computes round-trip cost threshold `tau_cost(H)` (`2 * fee + spread + slippage + funding + safetyMargin`).
- * - Verifies calibration status, OOD score, uncertainty, and cost-adjusted edge.
- * - Never triggers an order on its own; only produces advisory verdicts (`ALLOW_CANDIDATE`, `ABSTAIN_NO_EDGE`,
- *   `VETO_OPPOSITE_DIRECTION`, `SHADOW_OBSERVE_ONLY`).
+ * Evaluates all safety, freshness, OOD, drift, head-consistency, calibration-sample,
+ * and symbol-eligibility gates before allowing a forecast to authorize or size a trade.
  */
-object ForecastQualityGate {
-
-    data class QualityGateDecision(
-        val finalStatus: ForecastStatus,
-        val passesQualityGate: Boolean,
-        val costThresholdPct: BigDecimal,
-        val advisoryAction: String,
-        val reasonVi: String
-    )
-
-    fun computeCostThresholdPct(
-        horizon: String,
-        spreadPct: BigDecimal = BigDecimal("0.0004"),
-        takerFeeRate: BigDecimal = BigDecimal("0.0005"),
-        slippageRate: BigDecimal = BigDecimal("0.0004"),
-        fundingRatePer8h: BigDecimal = BigDecimal("0.0001"),
-        safetyMargin: BigDecimal = BigDecimal("0.0004")
-    ): BigDecimal {
-        val bars15m = when (horizon) {
-            "15m" -> BigDecimal.ONE
-            "1h" -> BigDecimal("4")
-            else -> BigDecimal("16")
-        }
-        val horizonScale = when (horizon) {
-            "15m" -> BigDecimal.ONE
-            "1h" -> BigDecimal("1.35")
-            else -> BigDecimal("1.85")
-        }
-        val fundingEst = fundingRatePer8h.abs()
-            .multiply(bars15m)
-            .divide(BigDecimal("32"), 6, RoundingMode.HALF_UP)
-        val baseCost = takerFeeRate.multiply(BigDecimal("2"))
-            .add(spreadPct)
-            .add(slippageRate)
-            .add(fundingEst)
-        val totalFraction = baseCost.add(safetyMargin.multiply(horizonScale))
-        // Return in percentage points (e.g. 0.0018 -> 0.1800%)
-        return totalFraction.multiply(BigDecimal("100")).setScale(4, RoundingMode.HALF_UP)
-    }
-
+class ForecastQualityGate(
+    private val maxInferenceLatencyMs: Long = 120L,
+    private val maxStaleBars: Int = 2,
+    private val maxFeatureDriftPsi: Double = 0.35
+) {
     fun evaluate(
-        horizon: String,
+        bundle: ForecastModelBundle,
+        input: ForecastTensorInput,
+        horizons: Map<Int, HorizonForecast>,
         operatingMode: ForecastOperatingMode,
-        driftEval: ForecastDriftMonitor.DriftEvaluation,
-        calibrationDist: ForecastCalibrationEngine.CalibratedDistribution,
-        expectedReturnPct: BigDecimal,
-        costThresholdPct: BigDecimal,
-        candidateSide: TradeSide = TradeSide.NONE
+        symbolEligibility: SymbolModelEligibility,
+        driftPsi: Double,
+        inferenceLatencyMs: Long
     ): QualityGateDecision {
-        if (driftEval.isOutOfDistribution) {
+        if (!input.isWarmupComplete) {
             return QualityGateDecision(
-                finalStatus = ForecastStatus.OUT_OF_DISTRIBUTION,
-                passesQualityGate = false,
-                costThresholdPct = costThresholdPct,
-                advisoryAction = "ABSTAIN_NO_EDGE",
-                reasonVi = driftEval.noteVi
+                status = ForecastStatus.WARMUP,
+                statusReason = "Sequence warmup incomplete (missing ${input.staleBarsCount} bars)",
+                compositeDirectionalScore = 0.0,
+                compositeConfidence = 0.0,
+                uncertaintyScore = 1.0,
+                headConsistent = true,
+                positionSizingMultiplier = 0.0,
+                allowTradeExecution = false
             )
         }
 
-        if (!calibrationDist.calibrationApplied) {
+        if (input.staleBarsCount > maxStaleBars) {
             return QualityGateDecision(
-                finalStatus = ForecastStatus.UNCALIBRATED,
-                passesQualityGate = false,
-                costThresholdPct = costThresholdPct,
-                advisoryAction = "SHADOW_OBSERVE_ONLY",
-                reasonVi = "Dự báo ở trạng thái UNCALIBRATED (N=${calibrationDist.sampleSize}, Method=${calibrationDist.method}) -> chỉ ghi nhận Shadow, không dùng để lọc lệnh."
+                status = ForecastStatus.STALE_FEED,
+                statusReason = "Market sequence feed is stale by ${input.staleBarsCount} bars (> $maxStaleBars)",
+                compositeDirectionalScore = 0.0,
+                compositeConfidence = 0.0,
+                uncertaintyScore = 1.0,
+                headConsistent = true,
+                positionSizingMultiplier = 0.0,
+                allowTradeExecution = false
             )
         }
 
-        val maxUncertainty = BigDecimal("0.82000")
-        if (calibrationDist.uncertainty > maxUncertainty) {
+        if (inferenceLatencyMs > maxInferenceLatencyMs) {
             return QualityGateDecision(
-                finalStatus = ForecastStatus.READY_VALIDATED,
-                passesQualityGate = false,
-                costThresholdPct = costThresholdPct,
-                advisoryAction = "ABSTAIN_NO_EDGE",
-                reasonVi = "Độ bất định dự báo cao (Uncertainty=${calibrationDist.uncertainty} > $maxUncertainty) -> Khuyến nghị đứng ngoài (ABSTAIN)."
+                status = ForecastStatus.TIMEOUT,
+                statusReason = "Inference latency ${inferenceLatencyMs}ms exceeded budget ${maxInferenceLatencyMs}ms",
+                compositeDirectionalScore = 0.0,
+                compositeConfidence = 0.0,
+                uncertaintyScore = 1.0,
+                headConsistent = true,
+                positionSizingMultiplier = 0.0,
+                allowTradeExecution = false
             )
         }
 
-        val pUp = calibrationDist.pUp
-        val pDown = calibrationDist.pDown
-        val minDirProb = BigDecimal("0.42000")
-        val minReturnEdgePct = costThresholdPct.multiply(BigDecimal("0.60")).setScale(4, RoundingMode.HALF_UP)
-
-        val hasBullishEdge = pUp >= minDirProb && expectedReturnPct >= minReturnEdgePct
-        val hasBearishEdge = pDown >= minDirProb && expectedReturnPct <= minReturnEdgePct.negate()
-
-        if (operatingMode == ForecastOperatingMode.SHADOW) {
+        val h15 = horizons[15]
+        val h60 = horizons[60]
+        val h240 = horizons[240]
+        if (h15 == null || h60 == null || h240 == null) {
             return QualityGateDecision(
-                finalStatus = ForecastStatus.READY_VALIDATED,
-                passesQualityGate = hasBullishEdge || hasBearishEdge,
-                costThresholdPct = costThresholdPct,
-                advisoryAction = "SHADOW_OBSERVE_ONLY",
-                reasonVi = "Chế độ SHADOW (${horizon}): pUp=${pUp.setScale(3, RoundingMode.HALF_UP)}, pDown=${pDown.setScale(3, RoundingMode.HALF_UP)}, E[r]=${expectedReturnPct.setScale(3, RoundingMode.HALF_UP)}% vs Cost=${costThresholdPct}%."
+                status = ForecastStatus.MODEL_MISMATCH,
+                statusReason = "Missing required multi-horizon outputs (15m/60m/240m)",
+                compositeDirectionalScore = 0.0,
+                compositeConfidence = 0.0,
+                uncertaintyScore = 1.0,
+                headConsistent = false,
+                positionSizingMultiplier = 0.0,
+                allowTradeExecution = false
             )
         }
 
-        // ADVISORY_TEST_ONLY mode
-        return when {
-            candidateSide == TradeSide.LONG && pDown > pUp.add(BigDecimal("0.12")) -> QualityGateDecision(
-                finalStatus = ForecastStatus.READY_VALIDATED,
-                passesQualityGate = false,
-                costThresholdPct = costThresholdPct,
-                advisoryAction = "VETO_OPPOSITE_DIRECTION",
-                reasonVi = "Advisory Veto ($horizon): Ứng viên LONG mâu thuẫn với xác suất giảm pDown=${pDown.setScale(3, RoundingMode.HALF_UP)} > pUp=${pUp.setScale(3, RoundingMode.HALF_UP)}."
+        // Check cross-head consistency across all horizons (Section 2.2 Defect #3 fix)
+        val inconsistentHorizon = listOf(h15, h60, h240).firstOrNull { !it.headConsistent }
+        val allHeadsConsistent = (inconsistentHorizon == null)
+
+        // Multi-horizon composite directional score in [-1.0, +1.0]
+        val dir15 = h15.pUp - h15.pDown
+        val dir60 = h60.pUp - h60.pDown
+        val dir240 = h240.pUp - h240.pDown
+        val compositeDir = max(-1.0, min(1.0, 0.50 * dir15 + 0.30 * dir60 + 0.20 * dir240))
+
+        val compositeConf = max(
+            0.0,
+            min(
+                1.0,
+                0.50 * h15.normalizedConfidence + 0.30 * h60.normalizedConfidence + 0.20 * h240.normalizedConfidence
             )
-            candidateSide == TradeSide.SHORT && pUp > pDown.add(BigDecimal("0.12")) -> QualityGateDecision(
-                finalStatus = ForecastStatus.READY_VALIDATED,
-                passesQualityGate = false,
-                costThresholdPct = costThresholdPct,
-                advisoryAction = "VETO_OPPOSITE_DIRECTION",
-                reasonVi = "Advisory Veto ($horizon): Ứng viên SHORT mâu thuẫn với xác suất tăng pUp=${pUp.setScale(3, RoundingMode.HALF_UP)} > pDown=${pDown.setScale(3, RoundingMode.HALF_UP)}."
-            )
-            hasBullishEdge || hasBearishEdge -> QualityGateDecision(
-                finalStatus = ForecastStatus.READY_VALIDATED,
-                passesQualityGate = true,
-                costThresholdPct = costThresholdPct,
-                advisoryAction = "ALLOW_CANDIDATE",
-                reasonVi = "Đạt ngưỡng biên lợi nhuận sau chi phí ($horizon): E[r]=${expectedReturnPct.setScale(3, RoundingMode.HALF_UP)}% vượt ngưỡng ${minReturnEdgePct}%."
-            )
-            else -> QualityGateDecision(
-                finalStatus = ForecastStatus.READY_VALIDATED,
-                passesQualityGate = false,
-                costThresholdPct = costThresholdPct,
-                advisoryAction = "ABSTAIN_NO_EDGE",
-                reasonVi = "Biên lợi nhuận kỳ vọng ($horizon: E[r]=${expectedReturnPct.setScale(3, RoundingMode.HALF_UP)}%) chưa vượt ngưỡng chi phí ${minReturnEdgePct}% -> ABSTAIN."
+        )
+        val compositeEntropy = 0.50 * h15.shannonEntropy + 0.30 * h60.shannonEntropy + 0.20 * h240.shannonEntropy
+
+        if (!allHeadsConsistent) {
+            return QualityGateDecision(
+                status = ForecastStatus.HEAD_INCONSISTENT,
+                statusReason = "Horizon ${inconsistentHorizon!!.horizonMinutes}m head contradiction: ${inconsistentHorizon.headInconsistencyReason}",
+                compositeDirectionalScore = compositeDir,
+                compositeConfidence = compositeConf,
+                uncertaintyScore = compositeEntropy,
+                headConsistent = false,
+                positionSizingMultiplier = 0.0,
+                allowTradeExecution = false
             )
         }
+
+        if (input.oodAnomalyScore > bundle.maxOodScoreThreshold || driftPsi > maxFeatureDriftPsi) {
+            return QualityGateDecision(
+                status = ForecastStatus.OUT_OF_DISTRIBUTION,
+                statusReason = "OOD score ${"%.2f".format(input.oodAnomalyScore)} (max ${bundle.maxOodScoreThreshold}) or PSI ${"%.2f".format(driftPsi)}",
+                compositeDirectionalScore = compositeDir,
+                compositeConfidence = compositeConf,
+                uncertaintyScore = compositeEntropy,
+                headConsistent = true,
+                positionSizingMultiplier = 0.0,
+                allowTradeExecution = false
+            )
+        }
+
+        if (symbolEligibility == SymbolModelEligibility.UNSUPPORTED ||
+            symbolEligibility == SymbolModelEligibility.BASELINE_ONLY
+        ) {
+            return QualityGateDecision(
+                status = ForecastStatus.DEGRADED_SHADOW_ONLY,
+                statusReason = "Symbol eligibility is $symbolEligibility (ML execution disabled; baseline/shadow only)",
+                compositeDirectionalScore = compositeDir,
+                compositeConfidence = compositeConf,
+                uncertaintyScore = compositeEntropy,
+                headConsistent = true,
+                positionSizingMultiplier = 0.0,
+                allowTradeExecution = false
+            )
+        }
+
+        // Check if calibration sample size is insufficient (< 200 validation samples)
+        val insufficientCalib = listOf(h15, h60, h240).any {
+            it.calibrationQualificationStatus == "INSUFFICIENT_SAMPLE_SHADOW_ONLY"
+        }
+
+        if (operatingMode == ForecastOperatingMode.DISABLED || operatingMode == ForecastOperatingMode.SHADOW) {
+            return QualityGateDecision(
+                status = if (insufficientCalib) ForecastStatus.INSUFFICIENT_CALIBRATION_SAMPLE else ForecastStatus.VALID,
+                statusReason = if (insufficientCalib) {
+                    "Shadow mode active (calibration sample N=${h15.calibrationSampleSize} < 200; shadow logging only)"
+                } else {
+                    "Shadow mode active (forecast recorded without execution gating)"
+                },
+                compositeDirectionalScore = compositeDir,
+                compositeConfidence = compositeConf,
+                uncertaintyScore = compositeEntropy,
+                headConsistent = true,
+                positionSizingMultiplier = 1.0,
+                allowTradeExecution = false
+            )
+        }
+
+        // In GATED_ENFORCEMENT or ADAPTIVE_SIZING, block ML trade authorization if calibration sample is unqualified
+        if (insufficientCalib) {
+            return QualityGateDecision(
+                status = ForecastStatus.INSUFFICIENT_CALIBRATION_SAMPLE,
+                statusReason = "Calibration validation sample N=${h15.calibrationSampleSize} < 200; restricted to SHADOW until qualified",
+                compositeDirectionalScore = compositeDir,
+                compositeConfidence = compositeConf,
+                uncertaintyScore = compositeEntropy,
+                headConsistent = true,
+                positionSizingMultiplier = 0.0,
+                allowTradeExecution = false
+            )
+        }
+
+        if (compositeConf < bundle.minConfidenceThreshold || compositeEntropy > bundle.maxEntropyThreshold) {
+            return QualityGateDecision(
+                status = ForecastStatus.LOW_CONFIDENCE,
+                statusReason = "Confidence ${"%.2f".format(compositeConf)} < ${bundle.minConfidenceThreshold} or entropy ${"%.2f".format(compositeEntropy)} > ${bundle.maxEntropyThreshold}",
+                compositeDirectionalScore = compositeDir,
+                compositeConfidence = compositeConf,
+                uncertaintyScore = compositeEntropy,
+                headConsistent = true,
+                positionSizingMultiplier = 0.0,
+                allowTradeExecution = false
+            )
+        }
+
+        // Require alignment between 15m and 1h directional signs and positive expected return after fees
+        val aligned15mAnd1h = (dir15 * dir60) > 0.0
+        val costFloorPct = 0.12
+        val expectedEdge15m = abs(h15.expectedReturnPct)
+        if (!aligned15mAnd1h || expectedEdge15m < costFloorPct) {
+            return QualityGateDecision(
+                status = ForecastStatus.LOW_CONFIDENCE,
+                statusReason = "Multi-horizon alignment=${aligned15mAnd1h} or 15m expected return ${"%.3f".format(h15.expectedReturnPct)}% below cost floor ${costFloorPct}%",
+                compositeDirectionalScore = compositeDir,
+                compositeConfidence = compositeConf,
+                uncertaintyScore = compositeEntropy,
+                headConsistent = true,
+                positionSizingMultiplier = 0.0,
+                allowTradeExecution = false
+            )
+        }
+
+        val sizingMult = if (operatingMode == ForecastOperatingMode.ADAPTIVE_SIZING) {
+            // Bounded adaptive multiplier in [0.50, 1.00] — never increases leverage above risk budget
+            val rawMult = 0.50 + 0.50 * ((compositeConf - bundle.minConfidenceThreshold) / max(0.05, 1.0 - bundle.minConfidenceThreshold))
+            max(0.50, min(1.00, rawMult))
+        } else {
+            1.00
+        }
+
+        return QualityGateDecision(
+            status = ForecastStatus.VALID,
+            statusReason = "All forecast quality, consistency, and cost-floor gates passed",
+            compositeDirectionalScore = compositeDir,
+            compositeConfidence = compositeConf,
+            uncertaintyScore = compositeEntropy,
+            headConsistent = true,
+            positionSizingMultiplier = sizingMult,
+            allowTradeExecution = true
+        )
     }
 }

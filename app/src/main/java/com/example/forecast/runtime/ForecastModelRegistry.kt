@@ -1,106 +1,52 @@
 package com.example.forecast.runtime
 
 import android.content.Context
-import com.example.forecast.data.ForecastFeatureSchema
-import com.example.forecast.data.ForecastScaler
+import com.example.domain.SymbolModelEligibility
 import com.example.forecast.domain.ForecastModelBundle
-import com.example.forecast.domain.ForecastStatus
-import com.example.forecast.engine.ForecastCalibrationEngine
-import java.io.File
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
-/**
- * Model Registry & Automatic Rollback Controller (`ForecastModelRegistry.kt`, Section 14).
- * - Holds the verified Champion (`astra_gru_tcn_hybrid_v1_int8`) and Rollback (`astra_logistic_l2_baseline_v1`) runtimes.
- * - Automatically switches to Rollback Baseline if `>= 3` consecutive inference errors occur.
- */
-class ForecastModelRegistry {
+class ForecastModelRegistry(
+    private val loader: ForecastModelLoader
+) {
+    private val activeArtifactsRef = AtomicReference<LoadedForecastArtifacts?>(null)
+    private val lastLoadErrorRef = AtomicReference<String?>(null)
 
-    @Volatile
-    var loadStatus: ForecastStatus = ForecastStatus.MODEL_MISSING
-        private set
-
-    @Volatile
-    var loadErrorReasonVi: String? = "Chưa khởi tạo gói model dự báo."
-        private set
-
-    @Volatile
-    var bundleMetadata: ForecastModelBundle? = null
-        private set
-
-    @Volatile
-    var schema: ForecastFeatureSchema? = null
-        private set
-
-    @Volatile
-    var scaler: ForecastScaler? = null
-        private set
-
-    @Volatile
-    var calibrationEngine: ForecastCalibrationEngine? = null
-        private set
-
-    @Volatile
-    var runtime: LiteRtForecastRuntime? = null
-        private set
-
-    @Volatile
-    var lastLoadLatencyMs: Long = 0L
-        private set
-
-    private val consecutiveRuntimeErrors = AtomicInteger(0)
-
-    fun initializeFromAssets(context: Context, cpuThreads: Int = 2): ForecastStatus {
-        val loaded = ForecastModelLoader.loadFromAssets(context, cpuThreads = cpuThreads)
-        applyLoadedArtifacts(loaded)
-        return loaded.status
-    }
-
-    fun initializeFromDirectory(directory: File, cpuThreads: Int = 2): ForecastStatus {
-        val loaded = ForecastModelLoader.loadFromDirectory(directory, cpuThreads = cpuThreads)
-        applyLoadedArtifacts(loaded)
-        return loaded.status
-    }
-
-    fun initializeFromByteProvider(readBytes: (String) -> ByteArray, cpuThreads: Int = 2): ForecastStatus {
-        val loaded = ForecastModelLoader.loadFromByteProvider(readBytes, cpuThreads = cpuThreads)
-        applyLoadedArtifacts(loaded)
-        return loaded.status
-    }
-
-    private fun applyLoadedArtifacts(loaded: ForecastModelLoader.LoadedForecastBundleArtifacts) {
-        runtime?.close()
-        loadStatus = loaded.status
-        loadErrorReasonVi = loaded.errorReasonVi
-        bundleMetadata = loaded.bundleMetadata
-        schema = loaded.schema
-        scaler = loaded.scaler
-        calibrationEngine = loaded.calibrationEngine
-        runtime = loaded.runtime
-        lastLoadLatencyMs = loaded.loadLatencyMs
-        consecutiveRuntimeErrors.set(0)
-    }
-
-    fun recordInferenceSuccess() {
-        consecutiveRuntimeErrors.set(0)
-    }
-
-    fun recordInferenceFailureAndMaybeRollback(): Boolean {
-        val count = consecutiveRuntimeErrors.incrementAndGet()
-        val rt = runtime ?: return false
-        if (count >= 3 && !rt.isRollbackMode) {
-            rt.setRollbackToBaseline(true)
-            return true
+    fun initialize(): Result<LoadedForecastArtifacts> {
+        val res = loader.loadAndVerifyBundle()
+        res.onSuccess { artifacts ->
+            activeArtifactsRef.set(artifacts)
+            lastLoadErrorRef.set(null)
+        }.onFailure { err ->
+            activeArtifactsRef.set(null)
+            lastLoadErrorRef.set(err.message ?: "Unknown forecast model bundle load failure")
         }
-        return rt.isRollbackMode
+        return res
     }
 
-    fun triggerManualRollback(enableRollback: Boolean) {
-        runtime?.setRollbackToBaseline(enableRollback)
-        if (!enableRollback) {
-            consecutiveRuntimeErrors.set(0)
+    fun getActiveArtifacts(): LoadedForecastArtifacts? = activeArtifactsRef.get()
+
+    fun getActiveBundle(): ForecastModelBundle? = activeArtifactsRef.get()?.bundle
+
+    fun getLastLoadError(): String? = lastLoadErrorRef.get()
+
+    fun getSymbolEligibility(symbol: String): SymbolModelEligibility {
+        val bundle = activeArtifactsRef.get()?.bundle ?: return SymbolModelEligibility.UNSUPPORTED
+        val normalized = symbol.uppercase()
+        val rawTag = bundle.symbolEligibility[normalized]
+        if (rawTag != null) {
+            return runCatching { SymbolModelEligibility.valueOf(rawTag) }
+                .getOrDefault(SymbolModelEligibility.POOLED_MODEL_ONLY)
+        }
+        return if (bundle.supportedSymbols.contains(normalized)) {
+            SymbolModelEligibility.POOLED_MODEL_ONLY
+        } else {
+            SymbolModelEligibility.BASELINE_ONLY
         }
     }
 
-    fun getConsecutiveErrorCount(): Int = consecutiveRuntimeErrors.get()
+    companion object {
+        fun createDefault(context: Context): ForecastModelRegistry {
+            return ForecastModelRegistry(ForecastModelLoader(context.applicationContext))
+        }
+    }
 }

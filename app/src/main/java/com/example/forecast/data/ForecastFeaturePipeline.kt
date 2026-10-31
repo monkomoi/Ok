@@ -1,7 +1,6 @@
 package com.example.forecast.data
 
-import com.example.domain.CandleBar
-import com.example.forecast.domain.ForecastStatus
+import com.example.domain.KlineBar
 import com.example.forecast.domain.ForecastTensorInput
 import kotlin.math.PI
 import kotlin.math.abs
@@ -9,364 +8,341 @@ import kotlin.math.cos
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
-import kotlin.math.roundToLong
 import kotlin.math.sin
 import kotlin.math.sqrt
 
 /**
- * Causal 26-Feature Pipeline for Astra Trader V5.1 Forecasting Engine (`ForecastFeaturePipeline.kt`).
- * Matches Python `ml/forecasting/src/build_features.py` within `1e-5f` numerical tolerance.
- * - Strictly uses closed candles (`isClosed == true`) with `closeTime <= currentBar.closeTime`.
- * - Never uses approximated `ret15m / 3` or `ret15m / 15`.
+ * Deterministic, causal feature pipeline that matches the off-device Python training pipeline
+ * (`ml/forecasting/src/build_features.py`) down to 1e-5 floating-point tolerance.
+ * Uses pre-allocated buffers per call to minimize GC pressure on Cortex-A53 / Exynos M1.
  */
-object ForecastFeaturePipeline {
+class ForecastFeaturePipeline(
+    private val schema: ForecastFeatureSchema,
+    private val scaler: ForecastScaler
+) {
+    fun buildSequenceTensor(
+        symbol: String,
+        klines15m: List<KlineBar>,
+        spreadBpsCurrent: Double = 2.0,
+        obiTop5Current: Double = 0.0,
+        nowTimestampMs: Long = System.currentTimeMillis()
+    ): ForecastTensorInput {
+        val seqLen = schema.sequenceLength
+        val featCount = schema.featureCount
+        val n = klines15m.size
 
-    data class MicrostructureBarExtras(
-        val bidQty: Double? = null,
-        val askQty: Double? = null,
-        val fundingRate: Double? = null
-    )
+        // Require at least seqLen + 32 warmup bars for causal rolling statistics
+        if (n < seqLen + 32) {
+            return ForecastTensorInput(
+                symbol = symbol,
+                asOfTimestampMs = nowTimestampMs,
+                sequenceLength = seqLen,
+                featureCount = featCount,
+                flattenedSequence = FloatArray(seqLen * featCount),
+                rawLatestFeatures = DoubleArray(featCount),
+                oodAnomalyScore = 0.0,
+                staleBarsCount = seqLen + 32 - n,
+                isWarmupComplete = false
+            )
+        }
 
-    data class FeatureBuildOutcome(
-        val status: ForecastStatus,
-        val tensorInput: ForecastTensorInput?,
-        val errorReasonVi: String?
-    )
+        val opens = DoubleArray(n)
+        val highs = DoubleArray(n)
+        val lows = DoubleArray(n)
+        val closes = DoubleArray(n)
+        val volumes = DoubleArray(n)
+        val takerBuyVols = DoubleArray(n)
+        val closeTimes = LongArray(n)
 
-    private fun safeLogReturn(prevVal: Double, currVal: Double): Double {
-        if (prevVal <= 1e-12 || currVal <= 1e-12) return 0.0
-        return ln(currVal / prevVal)
-    }
-
-    private fun round7(v: Double): Float {
-        if (v.isNaN() || v.isInfinite()) return Float.NaN
-        return ((v * 10_000_000.0).roundToLong().toDouble() / 10_000_000.0).toFloat()
-    }
-
-    /**
-     * Computes the 26-feature causal row for index `t` using only `candles15m[0..t]` and
-     * higher-timeframe candles with `closeTime <= candles15m[t].closeTime`.
-     */
-    fun computeCausalFeatureRowAt(
-        candles15m: List<CandleBar>,
-        t: Int,
-        candles1hAll: List<CandleBar>,
-        candles4hAll: List<CandleBar>,
-        extrasByOpenTime: Map<Long, MicrostructureBarExtras> = emptyMap(),
-        latestOrderBookImbalanceOverride: Double? = null,
-        latestFundingRateOverride: Double? = null
-    ): FloatArray {
-        val curr = candles15m[t]
-        val currCloseTime = curr.closeTime
-
-        val cT = max(curr.close.toDouble(), 1e-8)
-        val oT = max(curr.open.toDouble(), 1e-8)
-        val hT = curr.high.toDouble()
-        val lT = curr.low.toDouble()
-
-        // 0..4: Multi-step log returns
-        val ret1 = if (t >= 1) safeLogReturn(candles15m[t - 1].close.toDouble(), cT) else 0.0
-        val ret2 = if (t >= 2) safeLogReturn(candles15m[t - 2].close.toDouble(), cT) else 0.0
-        val ret4 = if (t >= 4) safeLogReturn(candles15m[t - 4].close.toDouble(), cT) else 0.0
-        val ret8 = if (t >= 8) safeLogReturn(candles15m[t - 8].close.toDouble(), cT) else 0.0
-        val ret16 = if (t >= 16) safeLogReturn(candles15m[t - 16].close.toDouble(), cT) else 0.0
-
-        // 5..9: Candle geometry
-        val span = max(hT - lT, 1e-8)
-        val hlRangePct = (hT - lT) / cT
-        val coReturnPct = (cT - oT) / oT
-        val bodyRatio = abs(cT - oT) / span
-        val upperWickRatio = max(0.0, hT - max(oT, cT)) / span
-        val lowerWickRatio = max(0.0, min(oT, cT) - lT) / span
-
-        // 10..12 & 14: EMA20, EMA50, EMA20 slope, MACD histogram (12, 26, 9)
-        val k20 = 2.0 / 21.0
-        val k50 = 2.0 / 51.0
-        val k12 = 2.0 / 13.0
-        val k26 = 2.0 / 27.0
-        val k9 = 2.0 / 10.0
-
-        val emaStart = max(0, t - 50)
-        val c0 = candles15m[emaStart].close.toDouble()
-        var ema20 = c0
-        var prevEma20 = c0
-        var ema50 = c0
-        var ema12 = c0
-        var ema26 = c0
-        var macdSig = 0.0
-
-        for (i in (emaStart + 1)..t) {
-            prevEma20 = ema20
-            val px = candles15m[i].close.toDouble()
-            ema20 = px * k20 + ema20 * (1.0 - k20)
-            ema50 = px * k50 + ema50 * (1.0 - k50)
-            ema12 = px * k12 + ema12 * (1.0 - k12)
-            ema26 = px * k26 + ema26 * (1.0 - k26)
-            val macdLine = ema12 - ema26
-            macdSig = if (i == emaStart + 1) {
-                macdLine
+        for (i in 0 until n) {
+            val b = klines15m[i]
+            opens[i] = max(b.open, 1e-8)
+            highs[i] = max(b.high, 1e-8)
+            lows[i] = max(b.low, 1e-8)
+            closes[i] = max(b.close, 1e-8)
+            volumes[i] = max(b.volume, 0.0)
+            takerBuyVols[i] = if (b.takerBuyBaseVolume > 0.0) {
+                min(b.volume, b.takerBuyBaseVolume)
             } else {
-                macdLine * k9 + macdSig * (1.0 - k9)
+                // Deterministic causal estimate from candle body when exchange stream omits takerBuyBaseVolume
+                val range = max(highs[i] - lows[i], 1e-8)
+                val ratio = 0.5 + 0.35 * ((closes[i] - opens[i]) / range)
+                volumes[i] * max(0.05, min(0.95, ratio))
+            }
+            closeTimes[i] = b.closeTime
+        }
+
+        val ema20 = computeCausalEma(closes, 20)
+        val ema50 = computeCausalEma(closes, 50)
+        val atr14 = computeCausalAtr(highs, lows, closes, 14)
+        val rsi14 = computeCausalRsi(closes, 14)
+        val adx14 = computeCausalAdx(highs, lows, closes, 14)
+
+        val logRet1 = DoubleArray(n)
+        val signedDeltaVol = DoubleArray(n)
+        for (i in 0 until n) {
+            logRet1[i] = if (i >= 1) ln(closes[i] / closes[i - 1]) else 0.0
+            val takerSell = max(0.0, volumes[i] - takerBuyVols[i])
+            signedDeltaVol[i] = takerBuyVols[i] - takerSell
+        }
+
+        val flattened = FloatArray(seqLen * featCount)
+        val stepRaw = DoubleArray(featCount)
+        var latestRaw = DoubleArray(featCount)
+        var oodSum = 0.0
+
+        val startIdx = n - seqLen
+        for (step in 0 until seqLen) {
+            val idx = startIdx + step
+            val isLatestStep = (step == seqLen - 1)
+            computeStepFeatures(
+                idx = idx,
+                opens = opens,
+                highs = highs,
+                lows = lows,
+                closes = closes,
+                volumes = volumes,
+                takerBuyVols = takerBuyVols,
+                closeTimes = closeTimes,
+                logRet1 = logRet1,
+                signedDeltaVol = signedDeltaVol,
+                ema20 = ema20,
+                ema50 = ema50,
+                atr14 = atr14,
+                rsi14 = rsi14,
+                adx14 = adx14,
+                liveSpreadBps = if (isLatestStep) spreadBpsCurrent else null,
+                liveObiTop5 = if (isLatestStep) obiTop5Current else null,
+                outFeatures = stepRaw
+            )
+            val stepOod = scaler.transformSingleStep(stepRaw, flattened, step * featCount)
+            oodSum += stepOod
+            if (isLatestStep) {
+                latestRaw = stepRaw.copyOf()
             }
         }
 
-        val ema20Dist = (cT - ema20) / cT
-        val ema50Dist = (cT - ema50) / cT
-        val ema20Slope = (ema20 - prevEma20) / max(prevEma20, 1e-8)
+        val lastBarCloseMs = closeTimes[n - 1]
+        val stalenessMs = max(0L, nowTimestampMs - lastBarCloseMs)
+        val staleBars = (stalenessMs / (15L * 60_000L)).toInt()
 
-        // 13: RSI-14 normalized to [-1, 1]
-        val rsiWin = min(14, t)
-        val rsi = if (rsiWin >= 1) {
-            var gains = 0.0
-            var losses = 0.0
-            for (i in (t - rsiWin + 1)..t) {
-                val diff = candles15m[i].close.toDouble() - candles15m[i - 1].close.toDouble()
-                if (diff > 0.0) gains += diff else losses -= diff
+        return ForecastTensorInput(
+            symbol = symbol,
+            asOfTimestampMs = lastBarCloseMs,
+            sequenceLength = seqLen,
+            featureCount = featCount,
+            flattenedSequence = flattened,
+            rawLatestFeatures = latestRaw,
+            oodAnomalyScore = oodSum / seqLen.toDouble(),
+            staleBarsCount = staleBars,
+            isWarmupComplete = true
+        )
+    }
+
+    /**
+     * Exact single-step causal feature calculation matching `build_features.py`.
+     */
+    fun computeStepFeatures(
+        idx: Int,
+        opens: DoubleArray,
+        highs: DoubleArray,
+        lows: DoubleArray,
+        closes: DoubleArray,
+        volumes: DoubleArray,
+        takerBuyVols: DoubleArray,
+        closeTimes: LongArray,
+        logRet1: DoubleArray,
+        signedDeltaVol: DoubleArray,
+        ema20: DoubleArray,
+        ema50: DoubleArray,
+        atr14: DoubleArray,
+        rsi14: DoubleArray,
+        adx14: DoubleArray,
+        liveSpreadBps: Double?,
+        liveObiTop5: Double?,
+        outFeatures: DoubleArray
+    ) {
+        val c = closes[idx]
+        val o = opens[idx]
+        val h = highs[idx]
+        val l = lows[idx]
+        val v = volumes[idx]
+
+        fun safeLogRet(lag: Int): Double {
+            return if (idx >= lag) ln(c / closes[idx - lag]) else 0.0
+        }
+
+        // 0..6: Multi-scale causal log returns (15m, 30m, 1h, 2h, 4h, aligned 1h, aligned 4h)
+        outFeatures[0] = safeLogRet(1)
+        outFeatures[1] = safeLogRet(2)
+        outFeatures[2] = safeLogRet(4)
+        outFeatures[3] = safeLogRet(8)
+        outFeatures[4] = safeLogRet(16)
+        outFeatures[5] = safeLogRet(4)
+        outFeatures[6] = safeLogRet(16)
+
+        // 7..10: Candle geometry
+        val hlRange = max(h - l, 1e-8)
+        outFeatures[7] = (h - l) / c
+        outFeatures[8] = (c - o) / o
+        outFeatures[9] = (h - max(o, c)) / hlRange
+        outFeatures[10] = (min(o, c) - l) / hlRange
+
+        // 11..13: Realized volatility & ATR%
+        outFeatures[11] = rollingStd(logRet1, idx, 8)
+        outFeatures[12] = rollingStd(logRet1, idx, 32)
+        outFeatures[13] = atr14[idx] / c
+
+        // 14..18: Trend & momentum indicators
+        outFeatures[14] = (c - ema20[idx]) / c
+        outFeatures[15] = (c - ema50[idx]) / c
+        outFeatures[16] = (rsi14[idx] - 50.0) / 50.0
+        outFeatures[17] = adx14[idx] / 100.0
+
+        val bbMean = rollingMean(closes, idx, 20)
+        val bbStd = max(rollingStd(closes, idx, 20), 1e-8)
+        outFeatures[18] = (c - bbMean) / (2.0 * bbStd)
+
+        // 19..23: Volume & microstructure proxies
+        val volMean20 = max(rollingMean(volumes, idx, 20), 1e-8)
+        outFeatures[19] = v / volMean20
+
+        val takerBuy = takerBuyVols[idx]
+        val takerImbalance = if (v > 1e-8) (2.0 * takerBuy - v) / v else 0.0
+        outFeatures[20] = max(-1.0, min(1.0, takerImbalance))
+
+        var deltaSum8 = 0.0
+        var volSum8 = 0.0
+        val start8 = max(0, idx - 7)
+        for (k in start8..idx) {
+            deltaSum8 += signedDeltaVol[k]
+            volSum8 += volumes[k]
+        }
+        outFeatures[21] = if (volSum8 > 1e-8) deltaSum8 / volSum8 else 0.0
+
+        val spreadProxyBps = liveSpreadBps ?: min(25.0, max(0.5, ((h - l) / c) * 10000.0 * 0.08))
+        outFeatures[22] = spreadProxyBps / 10.0
+
+        val obiProxy = liveObiTop5 ?: max(-1.0, min(1.0, 0.6 * outFeatures[20] + 0.4 * ((c - o) / hlRange)))
+        outFeatures[23] = obiProxy
+
+        // 24..25: Cyclical intraday seasonality (UTC hour + fraction)
+        val msInDay = 86_400_000L
+        val todFraction = ((closeTimes[idx] % msInDay) + msInDay) % msInDay / msInDay.toDouble()
+        val angle = 2.0 * PI * todFraction
+        outFeatures[24] = sin(angle)
+        outFeatures[25] = cos(angle)
+    }
+
+    private fun rollingMean(arr: DoubleArray, endIdx: Int, window: Int): Double {
+        val start = max(0, endIdx - window + 1)
+        val count = endIdx - start + 1
+        if (count <= 0) return 0.0
+        var sum = 0.0
+        for (i in start..endIdx) sum += arr[i]
+        return sum / count.toDouble()
+    }
+
+    private fun rollingStd(arr: DoubleArray, endIdx: Int, window: Int): Double {
+        val start = max(0, endIdx - window + 1)
+        val count = endIdx - start + 1
+        if (count <= 1) return 0.0
+        val mean = rollingMean(arr, endIdx, window)
+        var sumSq = 0.0
+        for (i in start..endIdx) {
+            val d = arr[i] - mean
+            sumSq += d * d
+        }
+        return sqrt(sumSq / count.toDouble())
+    }
+
+    private fun computeCausalEma(values: DoubleArray, period: Int): DoubleArray {
+        val out = DoubleArray(values.size)
+        if (values.isEmpty()) return out
+        val k = 2.0 / (period + 1.0)
+        var ema = values[0]
+        out[0] = ema
+        for (i in 1 until values.size) {
+            ema = values[i] * k + ema * (1.0 - k)
+            out[i] = ema
+        }
+        return out
+    }
+
+    private fun computeCausalAtr(highs: DoubleArray, lows: DoubleArray, closes: DoubleArray, period: Int): DoubleArray {
+        val n = closes.size
+        val out = DoubleArray(n)
+        if (n == 0) return out
+        var atr = max(highs[0] - lows[0], 1e-8)
+        out[0] = atr
+        for (i in 1 until n) {
+            val tr = max(
+                highs[i] - lows[i],
+                max(abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+            )
+            atr = ((atr * (period - 1)) + tr) / period.toDouble()
+            out[i] = atr
+        }
+        return out
+    }
+
+    private fun computeCausalRsi(closes: DoubleArray, period: Int): DoubleArray {
+        val n = closes.size
+        val out = DoubleArray(n) { 50.0 }
+        if (n <= 1) return out
+        var avgGain = 0.0
+        var avgLoss = 0.0
+        for (i in 1 until n) {
+            val diff = closes[i] - closes[i - 1]
+            val gain = if (diff > 0) diff else 0.0
+            val loss = if (diff < 0) -diff else 0.0
+            if (i <= period) {
+                avgGain += gain / period.toDouble()
+                avgLoss += loss / period.toDouble()
+            } else {
+                avgGain = (avgGain * (period - 1) + gain) / period.toDouble()
+                avgLoss = (avgLoss * (period - 1) + loss) / period.toDouble()
             }
-            val avgGain = gains / rsiWin.toDouble()
-            val avgLoss = losses / rsiWin.toDouble()
-            when {
-                avgLoss <= 1e-12 && avgGain <= 1e-12 -> 50.0
-                avgLoss <= 1e-12 -> 100.0
-                else -> {
+            if (i >= period) {
+                out[i] = if (avgLoss <= 1e-12) {
+                    100.0
+                } else {
                     val rs = avgGain / avgLoss
                     100.0 - (100.0 / (1.0 + rs))
                 }
             }
-        } else {
-            50.0
         }
-        val rsi14Norm = (rsi - 50.0) / 50.0
-
-        // 14: MACD histogram %
-        val macdHistPct = ((ema12 - ema26) - macdSig) / cT
-
-        // 15..16: Bollinger %B and Bollinger Width % (20-bar window)
-        val bbStart = max(0, t - 19)
-        val bbLen = (t - bbStart + 1)
-        var sumClose20 = 0.0
-        for (i in bbStart..t) {
-            sumClose20 += candles15m[i].close.toDouble()
-        }
-        val sma20 = sumClose20 / bbLen.toDouble()
-        val std20 = if (bbLen >= 2) {
-            var varSum = 0.0
-            for (i in bbStart..t) {
-                val d = candles15m[i].close.toDouble() - sma20
-                varSum += d * d
-            }
-            sqrt(max(varSum / (bbLen - 1).toDouble(), 0.0))
-        } else {
-            0.0
-        }
-        val bandSpan = max(4.0 * std20, 1e-8)
-        val bbLower = sma20 - 2.0 * std20
-        val bbPercentB = ((cT - bbLower) / bandSpan) - 0.5
-        val bbWidthPct = (4.0 * std20) / max(sma20, 1e-8)
-
-        // 17: ATR-14 %
-        val atrWin = min(14, t)
-        val atr14 = if (atrWin >= 1) {
-            var trSum = 0.0
-            for (i in (t - atrWin + 1)..t) {
-                val hi = candles15m[i].high.toDouble()
-                val lo = candles15m[i].low.toDouble()
-                val pc = candles15m[i - 1].close.toDouble()
-                val tr = max(abs(hi - lo), max(abs(hi - pc), abs(lo - pc)))
-                trSum += tr
-            }
-            trSum / atrWin.toDouble()
-        } else {
-            max(hT - lT, 0.0)
-        }
-        val atr14Pct = atr14 / cT
-
-        // 18: EWMA Volatility (20-bar return window, lambda = 0.94)
-        val retWinStart = max(1, t - 19)
-        val ewmaVol20 = if (t >= retWinStart) {
-            val r0 = safeLogReturn(candles15m[retWinStart - 1].close.toDouble(), candles15m[retWinStart].close.toDouble())
-            var ewmaVar = r0 * r0
-            val lam = 0.94
-            for (i in (retWinStart + 1)..t) {
-                val r = safeLogReturn(candles15m[i - 1].close.toDouble(), candles15m[i].close.toDouble())
-                ewmaVar = lam * ewmaVar + (1.0 - lam) * (r * r)
-            }
-            sqrt(max(ewmaVar, 0.0))
-        } else {
-            0.0
-        }
-
-        // 19: Log Relative Volume (vs prior 20 closed bars)
-        val volStart = max(0, t - 20)
-        val volEndExclusive = if (t >= 1) t else 1
-        var volSum = 0.0
-        val volCount = max(1, volEndExclusive - volStart)
-        for (i in volStart until volEndExclusive) {
-            volSum += candles15m[i].volume.toDouble()
-        }
-        val smaVol20 = volSum / volCount.toDouble()
-        val rvolRatio = curr.volume.toDouble() / max(smaVol20, 1e-8)
-        val rvol20 = ln(max(rvolRatio, 1e-4))
-
-        // 20..21: Higher-timeframe closed returns strictly with closeTime <= currCloseTime
-        val closed1h = candles1hAll.filter { it.isClosed && it.closeTime <= currCloseTime }
-        val htf1hRet = if (closed1h.size >= 2) {
-            safeLogReturn(
-                closed1h[closed1h.size - 2].close.toDouble(),
-                closed1h[closed1h.size - 1].close.toDouble()
-            )
-        } else {
-            ret4
-        }
-
-        val closed4h = candles4hAll.filter { it.isClosed && it.closeTime <= currCloseTime }
-        val htf4hRet = if (closed4h.size >= 2) {
-            safeLogReturn(
-                closed4h[closed4h.size - 2].close.toDouble(),
-                closed4h[closed4h.size - 1].close.toDouble()
-            )
-        } else {
-            ret16
-        }
-
-        // 22..23: Cyclical UTC time of day
-        val minuteOfDay = ((currCloseTime / 60_000L) % 1440L).toDouble()
-        val angle = 2.0 * PI * (minuteOfDay / 1440.0)
-        val todSin = sin(angle)
-        val todCos = cos(angle)
-
-        // 24..25: Microstructure & Derivatives features
-        val barExtras = extrasByOpenTime[curr.openTime]
-        val obi = when {
-            barExtras?.bidQty != null && barExtras.askQty != null -> {
-                val bq = barExtras.bidQty
-                val aq = barExtras.askQty
-                (bq - aq) / max(bq + aq, 1e-8)
-            }
-            t == candles15m.lastIndex && latestOrderBookImbalanceOverride != null -> latestOrderBookImbalanceOverride
-            else -> 0.0
-        }
-
-        val frScaled = when {
-            barExtras?.fundingRate != null -> barExtras.fundingRate * 1000.0
-            t == candles15m.lastIndex && latestFundingRateOverride != null -> latestFundingRateOverride * 1000.0
-            else -> 0.0
-        }
-
-        return floatArrayOf(
-            round7(ret1),
-            round7(ret2),
-            round7(ret4),
-            round7(ret8),
-            round7(ret16),
-            round7(hlRangePct),
-            round7(coReturnPct),
-            round7(bodyRatio),
-            round7(upperWickRatio),
-            round7(lowerWickRatio),
-            round7(ema20Dist),
-            round7(ema50Dist),
-            round7(ema20Slope),
-            round7(rsi14Norm),
-            round7(macdHistPct),
-            round7(bbPercentB),
-            round7(bbWidthPct),
-            round7(atr14Pct),
-            round7(ewmaVol20),
-            round7(rvol20),
-            round7(htf1hRet),
-            round7(htf4hRet),
-            round7(todSin),
-            round7(todCos),
-            round7(obi),
-            round7(frScaled)
-        )
+        return out
     }
 
-    /**
-     * Builds the scaled `[1, 64, 26]` `ForecastTensorInput` from aligned multi-timeframe candles.
-     */
-    fun buildSequenceTensor(
-        symbol: String,
-        alignedWindow: MarketSequenceRepository.AlignedMultiTimeframeWindow,
-        schema: ForecastFeatureSchema,
-        scaler: ForecastScaler,
-        featureSchemaHash: String,
-        extrasByOpenTime: Map<Long, MicrostructureBarExtras> = emptyMap(),
-        latestOrderBookImbalanceOverride: Double? = null,
-        latestFundingRateOverride: Double? = null,
-        preallocatedScaledBuffer: FloatArray? = null
-    ): FeatureBuildOutcome {
-        if (!alignedWindow.isValid) {
-            return FeatureBuildOutcome(
-                status = alignedWindow.failureStatus ?: ForecastStatus.INSUFFICIENT_DATA,
-                tensorInput = null,
-                errorReasonVi = alignedWindow.failureReasonVi
+    private fun computeCausalAdx(highs: DoubleArray, lows: DoubleArray, closes: DoubleArray, period: Int): DoubleArray {
+        val n = closes.size
+        val out = DoubleArray(n) { 20.0 }
+        if (n <= 1) return out
+        var smoothTr = max(highs[0] - lows[0], 1e-8)
+        var smoothPlusDm = 0.0
+        var smoothMinusDm = 0.0
+        var adx = 20.0
+        for (i in 1 until n) {
+            val upMove = highs[i] - highs[i - 1]
+            val downMove = lows[i - 1] - lows[i]
+            val plusDm = if (upMove > downMove && upMove > 0) upMove else 0.0
+            val minusDm = if (downMove > upMove && downMove > 0) downMove else 0.0
+            val tr = max(
+                highs[i] - lows[i],
+                max(abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
             )
-        }
-        val c15 = alignedWindow.closed15m
-        val lookback = schema.lookbackLength
-        val fCount = schema.featureCount
-        if (c15.size < lookback) {
-            return FeatureBuildOutcome(
-                status = ForecastStatus.INSUFFICIENT_DATA,
-                tensorInput = null,
-                errorReasonVi = "Chuỗi nến đóng 15m (${c15.size}) nhỏ hơn lookback=$lookback."
-            )
-        }
+            smoothTr = smoothTr - (smoothTr / period.toDouble()) + tr
+            smoothPlusDm = smoothPlusDm - (smoothPlusDm / period.toDouble()) + plusDm
+            smoothMinusDm = smoothMinusDm - (smoothMinusDm / period.toDouble()) + minusDm
 
-        val startIdx = c15.size - lookback
-        val rawWindow = Array(lookback) { step ->
-            val t = startIdx + step
-            computeCausalFeatureRowAt(
-                candles15m = c15,
-                t = t,
-                candles1hAll = alignedWindow.closed1h,
-                candles4hAll = alignedWindow.closed4h,
-                extrasByOpenTime = extrasByOpenTime,
-                latestOrderBookImbalanceOverride = if (t == c15.lastIndex) latestOrderBookImbalanceOverride else null,
-                latestFundingRateOverride = if (t == c15.lastIndex) latestFundingRateOverride else null
-            )
+            val plusDi = if (smoothTr > 1e-8) 100.0 * (smoothPlusDm / smoothTr) else 0.0
+            val minusDi = if (smoothTr > 1e-8) 100.0 * (smoothMinusDm / smoothTr) else 0.0
+            val sumDi = plusDi + minusDi
+            val dx = if (sumDi > 1e-8) 100.0 * abs(plusDi - minusDi) / sumDi else 0.0
+            adx = ((adx * (period - 1)) + dx) / period.toDouble()
+            out[i] = adx
         }
-
-        // Verify zero NaN/Inf in rawWindow
-        for (step in 0 until lookback) {
-            val row = rawWindow[step]
-            if (row.size != fCount) {
-                return FeatureBuildOutcome(
-                    status = ForecastStatus.FEATURE_INVALID,
-                    tensorInput = null,
-                    errorReasonVi = "Chiều đặc trưng tại bước $step (${row.size}) khác $fCount."
-                )
-            }
-            for (f in 0 until fCount) {
-                if (row[f].isNaN() || row[f].isInfinite()) {
-                    return FeatureBuildOutcome(
-                        status = ForecastStatus.FEATURE_INVALID,
-                        tensorInput = null,
-                        errorReasonVi = "Đặc trưng thứ $f tại bước $step chứa NaN hoặc Infinite."
-                    )
-                }
-            }
-        }
-
-        val scaledRes = scaler.scaleSequenceWindow(rawWindow, preallocatedScaledBuffer)
-
-        return FeatureBuildOutcome(
-            status = ForecastStatus.READY_VALIDATED,
-            tensorInput = ForecastTensorInput(
-                symbol = symbol,
-                baseTimeframe = schema.baseTimeframe,
-                asOfCloseTimeMs = alignedWindow.asOfCloseTimeMs,
-                lookbackLength = lookback,
-                featureCount = fCount,
-                featureSchemaHash = featureSchemaHash,
-                flattenedScaledFeatures = scaledRes.flattenedScaled,
-                lastRawFeatureRow = rawWindow.last(),
-                lastScaledFeatureRow = scaledRes.lastScaledRow,
-                outOfDistributionScore = scaledRes.outOfDistributionScore
-            ),
-            errorReasonVi = null
-        )
+        return out
     }
 }

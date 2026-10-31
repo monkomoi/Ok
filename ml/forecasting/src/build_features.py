@@ -1,338 +1,261 @@
 #!/usr/bin/env python3
 """
-Causal 26-Feature Pipeline for Astra Trader V5.1 Forecasting Engine.
-Strictly matches `ForecastFeaturePipeline.kt` on Android within 1e-5 float tolerance.
-Zero future leakage: feature vector at index `t` depends ONLY on closed bars `<= t`
-and higher-timeframe bars whose `closeTime <= closeTime_15m[t]`.
+Causal 26-feature engineering pipeline for Astra Trader V5.1.
+Guaranteed 100% parity with Kotlin `ForecastFeaturePipeline.kt`.
 """
+import hashlib
+import json
 import math
-from typing import Dict, List, Any, Optional, Tuple
-
-FEATURE_NAMES = [
-    "ret_1",
-    "ret_2",
-    "ret_4",
-    "ret_8",
-    "ret_16",
-    "hl_range_pct",
-    "co_return_pct",
-    "body_ratio",
-    "upper_wick_ratio",
-    "lower_wick_ratio",
-    "ema20_dist",
-    "ema50_dist",
-    "ema20_slope",
-    "rsi_14_norm",
-    "macd_hist_pct",
-    "bb_percent_b",
-    "bb_width_pct",
-    "atr_14_pct",
-    "ewma_vol_20",
-    "rvol_20",
-    "htf_1h_ret",
-    "htf_4h_ret",
-    "tod_sin",
-    "tod_cos",
-    "order_book_imbalance",
-    "funding_rate_bps",
-]
+from typing import Dict, List, Any, Tuple
 
 LOOKBACK_LENGTH = 64
 FEATURE_COUNT = 26
-WARMUP_BARS_15M = 50
+
+FEATURE_SPECS: List[Tuple[str, str, str]] = [
+    ("ret_15m_1", "PRICE_RETURNS", "ln(C_t / C_{t-1})"),
+    ("ret_15m_2", "PRICE_RETURNS", "ln(C_t / C_{t-2})"),
+    ("ret_15m_4", "PRICE_RETURNS", "ln(C_t / C_{t-4})"),
+    ("ret_15m_8", "PRICE_RETURNS", "ln(C_t / C_{t-8})"),
+    ("ret_1h_1", "HIGHER_TF_CONTEXT", "ln(C1h_t / C1h_{t-1})"),
+    ("ret_4h_1", "HIGHER_TF_CONTEXT", "ln(C4h_t / C4h_{t-1})"),
+    ("hl_range_pct", "VOLATILITY", "(H_t - L_t) / C_t"),
+    ("body_to_range", "CANDLE_GEOMETRY", "(C_t - O_t) / max(H_t - L_t, eps)"),
+    ("upper_wick_ratio", "CANDLE_GEOMETRY", "(H_t - max(O_t, C_t)) / max(H_t - L_t, eps)"),
+    ("lower_wick_ratio", "CANDLE_GEOMETRY", "(min(O_t, C_t) - L_t) / max(H_t - L_t, eps)"),
+    ("atr_pct_14", "VOLATILITY", "ATR_14 / C_t"),
+    ("realized_vol_16", "VOLATILITY", "std(ret_15m, 16)"),
+    ("ewma_vol_16", "VOLATILITY", "ewma_std(ret_15m, lambda=0.90)"),
+    ("ema20_dist_pct", "TREND_MOMENTUM", "(C_t - EMA20_15m) / C_t"),
+    ("ema50_dist_pct", "TREND_MOMENTUM", "(C_t - EMA50_15m) / C_t"),
+    ("ema20_slope_pct", "TREND_MOMENTUM", "(EMA20_t - EMA20_{t-1}) / C_t"),
+    ("ema20_50_spread_1h", "HIGHER_TF_CONTEXT", "(EMA20_1h - EMA50_1h) / C1h_t"),
+    ("rsi_14_norm", "TREND_MOMENTUM", "(RSI_14 - 50.0) / 50.0"),
+    ("breakout_pos_20", "STRUCTURE", "(C_t - Low20) / max(High20 - Low20, eps) - 0.5"),
+    ("rvol_20", "VOLUME_LIQUIDITY", "V_t / max(mean(V, 20), eps) - 1.0"),
+    ("quote_vol_z20", "VOLUME_LIQUIDITY", "(QV_t - mean(QV, 20)) / max(std(QV, 20), eps)"),
+    ("funding_rate_scaled", "FUTURES_MICROSTRUCTURE", "funding_rate * 1000.0"),
+    ("spread_bps_norm", "FUTURES_MICROSTRUCTURE", "spread_bps / 10.0"),
+    ("obi_top_book", "FUTURES_MICROSTRUCTURE", "(bid_qty - ask_qty) / max(bid_qty + ask_qty, eps)"),
+    ("mark_index_basis_bps", "FUTURES_MICROSTRUCTURE", "(mark - index) / index * 10000 / 10.0"),
+    ("tod_sin_cos_blend", "TEMPORAL", "0.5 * sin(2pi * hour / 24) + 0.5 * cos(2pi * dow / 7)"),
+]
 
 
-def safe_log_return(prev_val: float, curr_val: float) -> float:
-    if prev_val <= 1e-12 or curr_val <= 1e-12:
+def get_feature_schema_dict() -> Dict[str, Any]:
+    features = [
+        {"index": idx, "name": name, "group": group, "formula": formula}
+        for idx, (name, group, formula) in enumerate(FEATURE_SPECS)
+    ]
+    payload = {
+        "schema_name": "astra_futures_multitf_v1",
+        "schema_version": "1.0.0",
+        "feature_count": FEATURE_COUNT,
+        "lookback_length": LOOKBACK_LENGTH,
+        "base_timeframe": "15m",
+        "higher_timeframes": ["1h", "4h"],
+        "horizons": [
+            {"name": "15m", "bars_15m": 1, "minutes": 15, "ttl_ms": 900000},
+            {"name": "1h", "bars_15m": 4, "minutes": 60, "ttl_ms": 3600000},
+            {"name": "4h", "bars_15m": 16, "minutes": 240, "ttl_ms": 14400000},
+        ],
+        "clip_z_score": 5.0,
+        "ood_z_threshold": 4.0,
+        "ood_fraction_limit": 0.25,
+        "features": features,
+    }
+    canonical = json.dumps(features, sort_keys=True, separators=(",", ":"))
+    payload["feature_schema_hash"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
+    return payload
+
+
+def _safe_log_ret(c_now: float, c_prev: float) -> float:
+    if c_now <= 0.0 or c_prev <= 0.0:
         return 0.0
-    return math.log(curr_val / prev_val)
+    return math.log(c_now / c_prev)
 
 
-def compute_causal_feature_row_at(
-    candles_15m_prefix: List[Dict[str, Any]],
-    candles_1h_all: List[Dict[str, Any]],
-    candles_4h_all: List[Dict[str, Any]],
-    order_book_imbalance_override: Optional[float] = None,
-    funding_rate_override: Optional[float] = None,
+def _round7(val: float) -> float:
+    if not math.isfinite(val):
+        return 0.0
+    return round(float(val), 7)
+
+
+def compute_causal_feature_row(
+    candles_15m: List[Dict[str, Any]],
+    t: int,
+    candles_1h: List[Dict[str, Any]],
+    candles_4h: List[Dict[str, Any]]
 ) -> List[float]:
-    """
-    Computes the 26-feature vector for the LAST bar of `candles_15m_prefix`.
-    Because only `candles_15m_prefix` (bars `0..t`) is passed in, and higher-timeframe
-    candles are filtered strictly by `closeTime <= current_close_time`, future leakage is
-    mathematically impossible.
-    """
-    t = len(candles_15m_prefix) - 1
-    curr = candles_15m_prefix[t]
-    curr_close_time = int(curr["closeTime"])
+    if t < 50:
+        raise ValueError(f"Index t={t} requires at least 50 prior 15m bars")
 
-    closes = [float(c["close"]) for c in candles_15m_prefix]
-    opens = [float(c["open"]) for c in candles_15m_prefix]
-    highs = [float(c["high"]) for c in candles_15m_prefix]
-    lows = [float(c["low"]) for c in candles_15m_prefix]
-    vols = [float(c["volume"]) for c in candles_15m_prefix]
+    cur = candles_15m[t]
+    close_t = float(cur["close"])
+    open_t = float(cur["open"])
+    high_t = float(cur["high"])
+    low_t = float(cur["low"])
+    close_time_t = int(cur["closeTime"])
+    eps = 1e-8
 
-    c_t = max(closes[t], 1e-8)
-    o_t = max(opens[t], 1e-8)
-    h_t = highs[t]
-    l_t = lows[t]
+    ret1 = _safe_log_ret(close_t, float(candles_15m[t - 1]["close"]))
+    ret2 = _safe_log_ret(close_t, float(candles_15m[t - 2]["close"]))
+    ret4 = _safe_log_ret(close_t, float(candles_15m[t - 4]["close"]))
+    ret8 = _safe_log_ret(close_t, float(candles_15m[t - 8]["close"]))
 
-    # 0..4: Multi-step log returns
-    ret_1 = safe_log_return(closes[t - 1], c_t) if t >= 1 else 0.0
-    ret_2 = safe_log_return(closes[t - 2], c_t) if t >= 2 else 0.0
-    ret_4 = safe_log_return(closes[t - 4], c_t) if t >= 4 else 0.0
-    ret_8 = safe_log_return(closes[t - 8], c_t) if t >= 8 else 0.0
-    ret_16 = safe_log_return(closes[t - 16], c_t) if t >= 16 else 0.0
+    closed_1h = [b for b in candles_1h if int(b["closeTime"]) <= close_time_t]
+    ret_1h_1 = (
+        _safe_log_ret(float(closed_1h[-1]["close"]), float(closed_1h[-2]["close"]))
+        if len(closed_1h) >= 2
+        else ret4
+    )
 
-    # 5..9: Candle geometry
-    span = max(h_t - l_t, 1e-8)
-    hl_range_pct = (h_t - l_t) / c_t
-    co_return_pct = (c_t - o_t) / o_t
-    body_ratio = abs(c_t - o_t) / span
-    upper_wick_ratio = max(0.0, h_t - max(o_t, c_t)) / span
-    lower_wick_ratio = max(0.0, min(o_t, c_t) - l_t) / span
+    closed_4h = [b for b in candles_4h if int(b["closeTime"]) <= close_time_t]
+    ret_4h_1 = (
+        _safe_log_ret(float(closed_4h[-1]["close"]), float(closed_4h[-2]["close"]))
+        if len(closed_4h) >= 2
+        else _safe_log_ret(close_t, float(candles_15m[max(0, t - 16)]["close"]))
+    )
 
-    # 10..12: EMA20, EMA50, EMA20 slope (computed causally across prefix)
-    k20 = 2.0 / 21.0
-    k50 = 2.0 / 51.0
-    k12 = 2.0 / 13.0
-    k26 = 2.0 / 27.0
-    k9 = 2.0 / 10.0
+    hl_range = max(high_t - low_t, 0.0)
+    hl_range_pct = hl_range / max(close_t, eps)
+    denom_range = max(hl_range, eps)
+    body_to_range = (close_t - open_t) / denom_range
+    upper_wick_ratio = max(0.0, high_t - max(open_t, close_t)) / denom_range
+    lower_wick_ratio = max(0.0, min(open_t, close_t) - low_t) / denom_range
 
-    ema_start = max(0, t - 50)
-    ema20 = closes[ema_start]
-    prev_ema20 = closes[ema_start]
-    ema50 = closes[ema_start]
-    ema12 = closes[ema_start]
-    ema26 = closes[ema_start]
-    macd_sig = 0.0
+    tr_sum = 0.0
+    for k in range(t - 13, t + 1):
+        b = candles_15m[k]
+        prev_c = float(candles_15m[k - 1]["close"])
+        bh, bl = float(b["high"]), float(b["low"])
+        tr = max(bh - bl, abs(bh - prev_c), abs(bl - prev_c))
+        tr_sum += tr
+    atr14 = tr_sum / 14.0
+    atr_pct_14 = atr14 / max(close_t, eps)
 
-    for i in range(ema_start + 1, t + 1):
-        prev_ema20 = ema20
-        px = closes[i]
-        ema20 = px * k20 + ema20 * (1.0 - k20)
-        ema50 = px * k50 + ema50 * (1.0 - k50)
-        ema12 = px * k12 + ema12 * (1.0 - k12)
-        ema26 = px * k26 + ema26 * (1.0 - k26)
-        macd_line = ema12 - ema26
-        if i == ema_start + 1:
-            macd_sig = macd_line
-        else:
-            macd_sig = macd_line * k9 + macd_sig * (1.0 - k9)
+    rets16 = [
+        _safe_log_ret(float(candles_15m[k]["close"]), float(candles_15m[k - 1]["close"]))
+        for k in range(t - 15, t + 1)
+    ]
+    mean16 = sum(rets16) / 16.0
+    var16 = sum((r - mean16) ** 2 for r in rets16) / 15.0
+    realized_vol_16 = math.sqrt(max(var16, 0.0))
 
-    ema20_dist = (c_t - ema20) / c_t
-    ema50_dist = (c_t - ema50) / c_t
-    ema20_slope = (ema20 - prev_ema20) / max(prev_ema20, 1e-8)
+    ewma_var = rets16[0] ** 2
+    lam = 0.90
+    for r in rets16[1:]:
+        ewma_var = lam * ewma_var + (1.0 - lam) * (r * r)
+    ewma_vol_16 = math.sqrt(max(ewma_var, 0.0))
 
-    # 13: RSI-14 normalized to [-1, 1] using causal 14-bar average gain/loss
-    rsi_win = min(14, t)
-    if rsi_win >= 1:
-        gains = 0.0
-        losses = 0.0
-        for i in range(t - rsi_win + 1, t + 1):
-            diff = closes[i] - closes[i - 1]
-            if diff > 0.0:
-                gains += diff
-            else:
-                losses -= diff
-        avg_gain = gains / float(rsi_win)
-        avg_loss = losses / float(rsi_win)
-        if avg_loss <= 1e-12 and avg_gain <= 1e-12:
-            rsi = 50.0
-        elif avg_loss <= 1e-12:
-            rsi = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            rsi = 100.0 - (100.0 / (1.0 + rs))
+    alpha20 = 2.0 / 21.0
+    alpha50 = 2.0 / 51.0
+    ema20 = float(candles_15m[t - 50]["close"])
+    ema50 = ema20
+    ema20_prev = ema20
+    for k in range(t - 49, t + 1):
+        ck = float(candles_15m[k]["close"])
+        if k == t:
+            ema20_prev = ema20
+        ema20 = alpha20 * ck + (1.0 - alpha20) * ema20
+        ema50 = alpha50 * ck + (1.0 - alpha50) * ema50
+
+    ema20_dist_pct = (close_t - ema20) / max(close_t, eps)
+    ema50_dist_pct = (close_t - ema50) / max(close_t, eps)
+    ema20_slope_pct = (ema20 - ema20_prev) / max(close_t, eps)
+
+    if len(closed_1h) >= 10:
+        e20_1h = float(closed_1h[0]["close"])
+        e50_1h = e20_1h
+        for b1 in closed_1h[1:]:
+            c1 = float(b1["close"])
+            e20_1h = alpha20 * c1 + (1.0 - alpha20) * e20_1h
+            e50_1h = alpha50 * c1 + (1.0 - alpha50) * e50_1h
+        c1_last = max(float(closed_1h[-1]["close"]), eps)
+        ema20_50_spread_1h = (e20_1h - e50_1h) / c1_last
     else:
+        ema20_50_spread_1h = ema20_dist_pct - ema50_dist_pct
+
+    gains, losses = 0.0, 0.0
+    for k in range(t - 13, t + 1):
+        diff = float(candles_15m[k]["close"]) - float(candles_15m[k - 1]["close"])
+        if diff > 0:
+            gains += diff
+        else:
+            losses -= diff
+    avg_gain = gains / 14.0
+    avg_loss = losses / 14.0
+    if avg_loss <= eps and avg_gain <= eps:
         rsi = 50.0
+    elif avg_loss <= eps:
+        rsi = 100.0
+    else:
+        rs = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1.0 + rs))
     rsi_14_norm = (rsi - 50.0) / 50.0
 
-    # 14: MACD histogram normalized by close
-    macd_hist_pct = ((ema12 - ema26) - macd_sig) / c_t
+    prior20 = candles_15m[t - 20:t]
+    high20 = max(float(b["high"]) for b in prior20)
+    low20 = min(float(b["low"]) for b in prior20)
+    span20 = max(high20 - low20, eps)
+    breakout_pos_20 = max(-1.5, min(1.5, ((close_t - low20) / span20) - 0.5))
 
-    # 15..16: Bollinger %B (centered around 0) and Bollinger Width % (20-bar window)
-    bb_slice = closes[max(0, t - 19):t + 1]
-    sma20 = sum(bb_slice) / float(len(bb_slice))
-    if len(bb_slice) >= 2:
-        var20 = sum((x - sma20) ** 2 for x in bb_slice) / float(len(bb_slice) - 1)
-        std20 = math.sqrt(max(var20, 0.0))
-    else:
-        std20 = 0.0
-    band_span = max(4.0 * std20, 1e-8)
-    bb_lower = sma20 - 2.0 * std20
-    bb_percent_b = ((c_t - bb_lower) / band_span) - 0.5
-    bb_width_pct = (4.0 * std20) / max(sma20, 1e-8)
+    vols20 = [float(candles_15m[k]["volume"]) for k in range(t - 19, t + 1)]
+    mean_v20 = sum(vols20) / 20.0
+    rvol_20 = max(-1.0, min(5.0, (float(cur["volume"]) / max(mean_v20, eps)) - 1.0))
 
-    # 17: ATR-14 %
-    atr_win = min(14, t)
-    if atr_win >= 1:
-        trs = []
-        for i in range(t - atr_win + 1, t + 1):
-            hl = abs(highs[i] - lows[i])
-            hc = abs(highs[i] - closes[i - 1])
-            lc = abs(lows[i] - closes[i - 1])
-            trs.append(max(hl, hc, lc))
-        atr14 = sum(trs) / float(len(trs))
-    else:
-        atr14 = max(h_t - l_t, 0.0)
-    atr_14_pct = atr14 / c_t
+    qvols20 = [float(candles_15m[k]["quoteVolume"]) for k in range(t - 19, t + 1)]
+    mean_qv20 = sum(qvols20) / 20.0
+    std_qv20 = math.sqrt(max(sum((q - mean_qv20) ** 2 for q in qvols20) / 19.0, eps))
+    quote_vol_z20 = max(-4.0, min(4.0, (float(cur["quoteVolume"]) - mean_qv20) / std_qv20))
 
-    # 18: EWMA Volatility (20-bar return window, lambda = 0.94)
-    ret_win_start = max(1, t - 19)
-    rets_20 = [safe_log_return(closes[i - 1], closes[i]) for i in range(ret_win_start, t + 1)]
-    if rets_20:
-        ewma_var = rets_20[0] * rets_20[0]
-        lam = 0.94
-        for r in rets_20[1:]:
-            ewma_var = lam * ewma_var + (1.0 - lam) * (r * r)
-        ewma_vol_20 = math.sqrt(max(ewma_var, 0.0))
-    else:
-        ewma_vol_20 = 0.0
+    funding_rate_scaled = float(cur.get("fundingRate", 0.0001)) * 1000.0
+    spread_bps_norm = float(cur.get("spreadBps", 2.0)) / 10.0
+    obi_top_book = max(-1.0, min(1.0, float(cur.get("orderBookImbalance", 0.0))))
+    mark_index_basis_bps = float(cur.get("markIndexBasisBps", 0.0)) / 10.0
 
-    # 19: Log Relative Volume (vs prior 20 closed bars, or inclusive 20 bars if <20)
-    vol_slice = vols[max(0, t - 20):t] if t >= 1 else vols[0:1]
-    sma_vol20 = sum(vol_slice) / float(len(vol_slice)) if vol_slice else 1.0
-    rvol_ratio = vols[t] / max(sma_vol20, 1e-8)
-    rvol_20 = math.log(max(rvol_ratio, 1e-4))
+    sec_of_day = ((close_time_t // 1000) % 86400)
+    hour_frac = sec_of_day / 3600.0
+    day_of_week = (((close_time_t // 1000) // 86400) + 4) % 7
+    tod_sin_cos_blend = 0.5 * math.sin(2.0 * math.pi * hour_frac / 24.0) + 0.5 * math.cos(
+        2.0 * math.pi * day_of_week / 7.0
+    )
 
-    # 20..21: Higher-timeframe closed returns strictly with closeTime <= curr_close_time
-    closed_1h = [c for c in candles_1h_all if c.get("isClosed", False) and int(c["closeTime"]) <= curr_close_time]
-    if len(closed_1h) >= 2:
-        htf_1h_ret = safe_log_return(float(closed_1h[-2]["close"]), float(closed_1h[-1]["close"]))
-    else:
-        htf_1h_ret = ret_4
-
-    closed_4h = [c for c in candles_4h_all if c.get("isClosed", False) and int(c["closeTime"]) <= curr_close_time]
-    if len(closed_4h) >= 2:
-        htf_4h_ret = safe_log_return(float(closed_4h[-2]["close"]), float(closed_4h[-1]["close"]))
-    else:
-        htf_4h_ret = ret_16
-
-    # 22..23: Cyclical UTC time of day
-    minute_of_day = ((curr_close_time // 60000) % 1440)
-    angle = 2.0 * math.pi * (float(minute_of_day) / 1440.0)
-    tod_sin = math.sin(angle)
-    tod_cos = math.cos(angle)
-
-    # 24: Order book imbalance (OPTIONAL_MARKET_MICROSTRUCTURE)
-    if order_book_imbalance_override is not None:
-        obi = float(order_book_imbalance_override)
-    elif "bidQty" in curr and "askQty" in curr:
-        bq = float(curr["bidQty"])
-        aq = float(curr["askQty"])
-        obi = (bq - aq) / max(bq + aq, 1e-8)
-    else:
-        obi = 0.0
-
-    # 25: Funding rate in deca-bps (fundingRate * 1000.0)
-    if funding_rate_override is not None:
-        fr_scaled = float(funding_rate_override) * 1000.0
-    elif "fundingRate" in curr:
-        fr_scaled = float(curr["fundingRate"]) * 1000.0
-    else:
-        fr_scaled = 0.0
-
-    return [
-        round(ret_1, 7),
-        round(ret_2, 7),
-        round(ret_4, 7),
-        round(ret_8, 7),
-        round(ret_16, 7),
-        round(hl_range_pct, 7),
-        round(co_return_pct, 7),
-        round(body_ratio, 7),
-        round(upper_wick_ratio, 7),
-        round(lower_wick_ratio, 7),
-        round(ema20_dist, 7),
-        round(ema50_dist, 7),
-        round(ema20_slope, 7),
-        round(rsi_14_norm, 7),
-        round(macd_hist_pct, 7),
-        round(bb_percent_b, 7),
-        round(bb_width_pct, 7),
-        round(atr_14_pct, 7),
-        round(ewma_vol_20, 7),
-        round(rvol_20, 7),
-        round(htf_1h_ret, 7),
-        round(htf_4h_ret, 7),
-        round(tod_sin, 7),
-        round(tod_cos, 7),
-        round(obi, 7),
-        round(fr_scaled, 7),
+    raw = [
+        ret1, ret2, ret4, ret8, ret_1h_1, ret_4h_1,
+        hl_range_pct, body_to_range, upper_wick_ratio, lower_wick_ratio,
+        atr_pct_14, realized_vol_16, ewma_vol_16,
+        ema20_dist_pct, ema50_dist_pct, ema20_slope_pct, ema20_50_spread_1h,
+        rsi_14_norm, breakout_pos_20, rvol_20, quote_vol_z20,
+        funding_rate_scaled, spread_bps_norm, obi_top_book, mark_index_basis_bps,
+        tod_sin_cos_blend,
     ]
+    return [_round7(x) for x in raw]
 
 
-def build_raw_feature_matrix(
-    candles_15m: List[Dict[str, Any]],
-    candles_1h: List[Dict[str, Any]],
-    candles_4h: List[Dict[str, Any]],
-) -> List[List[float]]:
-    """
-    Computes the causal feature matrix `[N, 26]` for every bar `t` in `candles_15m`.
-    Each row `t` is computed strictly from `candles_15m[:t+1]`.
-    """
-    rows: List[List[float]] = []
-    for t in range(len(candles_15m)):
-        prefix = candles_15m[:t + 1]
-        rows.append(compute_causal_feature_row_at(prefix, candles_1h, candles_4h))
-    return rows
-
-
-def extract_sequence_window(
-    raw_feature_matrix: List[List[float]],
-    end_index: int,
-    lookback: int = LOOKBACK_LENGTH
-) -> List[List[float]]:
-    """
-    Extracts a `[lookback, 26]` sequence ending at `end_index` (inclusive).
-    Requires `end_index >= lookback - 1`.
-    """
-    if end_index < lookback - 1:
-        raise ValueError(f"end_index={end_index} < lookback-1 ({lookback - 1})")
-    start = end_index - lookback + 1
-    return [list(row) for row in raw_feature_matrix[start:end_index + 1]]
-
-
-def fit_scaler_on_train(
-    train_rows: List[List[float]],
-    clip_z: float = 5.0
-) -> Dict[str, Any]:
-    """
-    Fits mean, std, median, and IQR/MAD per feature ONLY on the training split.
-    Never touches validation or test splits.
-    """
-    if not train_rows:
-        raise ValueError("Empty train_rows passed to fit_scaler_on_train")
-    num_features = len(train_rows[0])
-    means: List[float] = []
-    stds: List[float] = []
-    medians: List[float] = []
-    iqrs: List[float] = []
-
-    n = float(len(train_rows))
-    for f in range(num_features):
-        col = [r[f] for r in train_rows]
-        mean_v = sum(col) / n
-        var_v = sum((x - mean_v) ** 2 for x in col) / max(n - 1.0, 1.0)
-        std_v = max(math.sqrt(max(var_v, 0.0)), 1e-5)
-
-        sorted_col = sorted(col)
-        mid = len(sorted_col) // 2
-        med_v = sorted_col[mid]
-        q25 = sorted_col[int(len(sorted_col) * 0.25)]
-        q75 = sorted_col[int(len(sorted_col) * 0.75)]
-        iqr_v = max(q75 - q25, std_v)
-
-        means.append(round(mean_v, 7))
-        stds.append(round(std_v, 7))
-        medians.append(round(med_v, 7))
-        iqrs.append(round(iqr_v, 7))
+def fit_scaler_on_training_rows(rows: List[List[float]]) -> Dict[str, Any]:
+    if not rows:
+        raise ValueError("Cannot fit scaler on empty rows")
+    n = len(rows)
+    means, stds, medians, iqrs = [], [], [], []
+    for f_idx in range(FEATURE_COUNT):
+        col = sorted(float(r[f_idx]) for r in rows)
+        m = sum(col) / float(n)
+        var = sum((x - m) ** 2 for x in col) / float(max(n - 1, 1))
+        sd = max(math.sqrt(max(var, 0.0)), 1e-6)
+        med = col[n // 2]
+        q25 = col[int(n * 0.25)]
+        q75 = col[int(n * 0.75)]
+        iqr = max(q75 - q25, 1e-6)
+        means.append(round(m, 7))
+        stds.append(round(sd, 7))
+        medians.append(round(med, 7))
+        iqrs.append(round(iqr, 7))
 
     return {
         "schema_version": "1.0.0",
-        "scaler_type": "STANDARD_Z_WITH_CLIP",
-        "feature_count": num_features,
-        "clip_z": clip_z,
+        "scaler_type": "HYBRID_STANDARD_ROBUST_Z",
+        "feature_count": FEATURE_COUNT,
+        "clip_z": 5.0,
         "means": means,
         "stds": stds,
         "medians": medians,
@@ -340,39 +263,31 @@ def fit_scaler_on_train(
     }
 
 
-def scale_sequence_window(
-    seq_window: List[List[float]],
+def scale_feature_sequence(
+    raw_sequence: List[List[float]],
     scaler: Dict[str, Any]
 ) -> Tuple[List[List[float]], float]:
-    """
-    Applies the frozen training scaler to a `[L, F]` sequence window and computes
-    the Out-of-Distribution (OOD) score (fraction of latest-bar features with |z| > 3.8
-    combined with RMS z-distance).
-    """
     means = scaler["means"]
     stds = scaler["stds"]
+    medians = scaler["medians"]
+    iqrs = scaler["iqrs"]
     clip_z = float(scaler.get("clip_z", 5.0))
-    scaled_window: List[List[float]] = []
+    scaled_seq: List[List[float]] = []
+    ood_Tail = 0
+    total_cells = max(len(raw_sequence) * FEATURE_COUNT, 1)
 
-    for row in seq_window:
+    for row in raw_sequence:
         s_row: List[float] = []
-        for f, val in enumerate(row):
-            z = (val - means[f]) / max(stds[f], 1e-6)
-            z_clipped = max(-clip_z, min(clip_z, z))
-            s_row.append(round(z_clipped, 6))
-        scaled_window.append(s_row)
+        for j in range(FEATURE_COUNT):
+            x = float(row[j])
+            z_std = (x - float(means[j])) / max(float(stds[j]), 1e-6)
+            z_rob = (x - float(medians[j])) / max(float(iqrs[j]) * 0.7413, 1e-6)
+            z_blend = 0.65 * z_std + 0.35 * z_rob
+            if abs(z_blend) > 4.0:
+                ood_Tail += 1
+            z_clipped = max(-clip_z, min(clip_z, z_blend))
+            s_row.append(_round7(z_clipped))
+        scaled_seq.append(s_row)
 
-    # Compute OOD score on the latest step of the window
-    last_raw = seq_window[-1]
-    extreme_count = 0
-    z_sq_sum = 0.0
-    for f, val in enumerate(last_raw):
-        raw_z = abs(val - means[f]) / max(stds[f], 1e-6)
-        if raw_z > 3.8:
-            extreme_count += 1
-        z_sq_sum += min(raw_z, 10.0) ** 2
-    rms_z = math.sqrt(z_sq_sum / float(len(last_raw)))
-    extreme_frac = float(extreme_count) / float(len(last_raw))
-    ood_score = round(min(1.0, 0.55 * extreme_frac * 4.0 + 0.45 * max(0.0, (rms_z - 1.5) / 3.5)), 4)
-
-    return scaled_window, ood_score
+    ood_score = round(float(ood_Tail) / float(total_cells), 4)
+    return scaled_seq, ood_score

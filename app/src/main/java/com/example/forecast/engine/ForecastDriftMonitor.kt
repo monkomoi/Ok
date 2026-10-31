@@ -1,59 +1,63 @@
 package com.example.forecast.engine
 
-import com.example.forecast.domain.ForecastStatus
-import com.example.forecast.domain.ForecastTensorInput
+import com.example.forecast.data.ForecastScalerConfig
 import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
 
 /**
- * Out-of-Distribution (`OOD`) & Feature Drift Monitor (`ForecastDriftMonitor.kt`, Section 8.3 & 14).
- * - Flags `OUT_OF_DISTRIBUTION` when `outOfDistributionScore >= oodRejectThreshold` (default `0.65f`)
- *   or when more than 25% of the latest step's features exceed `|z| > 3.8`.
+ * Lightweight rolling feature drift & OOD rate tracker using a fixed-capacity ring buffer
+ * so memory consumption is strictly constant on 4GB RAM devices.
  */
-object ForecastDriftMonitor {
+class ForecastDriftMonitor(
+    private val scalerConfig: ForecastScalerConfig,
+    private val windowCapacity: Int = 64
+) {
+    private val lock = Any()
+    private val recentZScoreMeans = DoubleArray(windowCapacity)
+    private val recentOodFlags = BooleanArray(windowCapacity)
+    private var cursor = 0
+    private var count = 0
 
-    const val DEFAULT_OOD_REJECT_THRESHOLD = 0.65f
-    const val EXTREME_Z_THRESHOLD = 3.8f
-    const val MAX_EXTREME_FEATURE_FRACTION = 0.25f
-
-    data class DriftEvaluation(
-        val isOutOfDistribution: Boolean,
-        val oodScore: Float,
-        val extremeFeatureFraction: Float,
-        val maxAbsZScore: Float,
-        val statusIfRejected: ForecastStatus?,
-        val noteVi: String
-    )
-
-    fun evaluateInputDrift(
-        input: ForecastTensorInput,
-        oodRejectThreshold: Float = DEFAULT_OOD_REJECT_THRESHOLD
-    ): DriftEvaluation {
-        val lastScaled = input.lastScaledFeatureRow
-        var extremeCount = 0
-        var maxAbsZ = 0f
-        for (z in lastScaled) {
-            val az = abs(z)
-            if (az > maxAbsZ) maxAbsZ = az
-            if (az > EXTREME_Z_THRESHOLD) extremeCount++
-        }
-        val extremeFrac = if (lastScaled.isNotEmpty()) {
-            extremeCount.toFloat() / lastScaled.size.toFloat()
-        } else 0f
-
-        val isOod = input.outOfDistributionScore >= oodRejectThreshold ||
-            extremeFrac > MAX_EXTREME_FEATURE_FRACTION
-
-        return DriftEvaluation(
-            isOutOfDistribution = isOod,
-            oodScore = input.outOfDistributionScore,
-            extremeFeatureFraction = extremeFrac,
-            maxAbsZScore = maxAbsZ,
-            statusIfRejected = if (isOod) ForecastStatus.OUT_OF_DISTRIBUTION else null,
-            noteVi = if (isOod) {
-                "Từ chối dự báo (OUT_OF_DISTRIBUTION): OOD=${String.format("%.3f", input.outOfDistributionScore)} >= $oodRejectThreshold (tỷ lệ đặc trưng lệch chuẩn=${String.format("%.1f%%", extremeFrac * 100f)})."
-            } else {
-                "Phân phối đặc trưng ổn định (OOD=${String.format("%.3f", input.outOfDistributionScore)} < $oodRejectThreshold)."
+    fun recordSample(rawLatestFeatures: DoubleArray, oodScore: Double, oodThreshold: Double): Double {
+        synchronized(lock) {
+            var zShiftSum = 0.0
+            val n = min(rawLatestFeatures.size, scalerConfig.stats.size)
+            for (i in 0 until n) {
+                val st = scalerConfig.stats[i]
+                val v = rawLatestFeatures[i]
+                val z = if (st.heavyTailed) {
+                    abs(v - st.median) / max(st.iqr, 1e-8)
+                } else {
+                    abs(v - st.mean) / max(st.std, 1e-8)
+                }
+                // Excess beyond expected ~0.8 average absolute Z-score for standard normal
+                zShiftSum += max(0.0, z - 0.85)
             }
-        )
+            val samplePsiProxy = if (n > 0) min(1.5, zShiftSum / n.toDouble()) else 0.0
+            recentZScoreMeans[cursor] = samplePsiProxy
+            recentOodFlags[cursor] = (oodScore > oodThreshold)
+            cursor = (cursor + 1) % windowCapacity
+            if (count < windowCapacity) count++
+            return getRollingPsiUnlocked()
+        }
+    }
+
+    fun getRollingPsi(): Double = synchronized(lock) { getRollingPsiUnlocked() }
+
+    fun getOodRatePct(): Double = synchronized(lock) {
+        if (count == 0) return 0.0
+        var oodCount = 0
+        for (i in 0 until count) {
+            if (recentOodFlags[i]) oodCount++
+        }
+        (oodCount.toDouble() / count.toDouble()) * 100.0
+    }
+
+    private fun getRollingPsiUnlocked(): Double {
+        if (count == 0) return 0.0
+        var sum = 0.0
+        for (i in 0 until count) sum += recentZScoreMeans[i]
+        return sum / count.toDouble()
     }
 }

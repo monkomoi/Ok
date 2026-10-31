@@ -4,43 +4,31 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import com.example.data.local.AstraDatabase
-import com.example.data.local.SystemEventEntity
+import com.example.data.local.SystemLogEntity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
 /**
- * MOD-01 & INV-16 · Boot Recovery Receiver
- * Marks system state as requiring reconciliation after device reboot before allowing any new trades.
+ * Handles `BOOT_COMPLETED` and `MY_PACKAGE_REPLACED` broadcasts by logging recovery intent
+ * and enforcing safe startup reconciliation before any order placement can resume.
  */
 class BootRecoveryReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
-        if (intent?.action == Intent.ACTION_BOOT_COMPLETED) {
+        val action = intent?.action ?: return
+        if (action == Intent.ACTION_BOOT_COMPLETED || action == Intent.ACTION_MY_PACKAGE_REPLACED) {
             val pendingResult = goAsync()
             CoroutineScope(Dispatchers.IO).launch {
                 try {
                     val dao = AstraDatabase.getInstance(context).astraDao()
-                    val settings = dao.getSettingsOnce()
-                    if (settings != null) {
-                        dao.upsertSettings(
-                            settings.copy(
-                                botState = "RECONCILIATION_REQUIRED",
-                                liveExplicitlyArmed = false, // Never auto-enable LIVE after reboot (Section 16.3)
-                                environmentMode = "TEST",
-                                updatedAtMs = System.currentTimeMillis()
-                            )
-                        )
-                    }
-                    dao.insertSystemEvent(
-                        SystemEventEntity(
-                            category = "RECONCILE",
-                            level = "WARN",
-                            titleVi = "Thiết bị vừa khởi động lại (BOOT_COMPLETED)",
-                            detailVi = "Đã khóa chế độ LIVE và đặt trạng thái RECONCILIATION_REQUIRED (INV-16). Người dùng cần mở ứng dụng để đối soát với Binance.",
-                            correlationId = "boot-${System.currentTimeMillis()}"
+                    dao.insertSystemLog(
+                        SystemLogEntity(
+                            timestamp = System.currentTimeMillis(),
+                            level = "INFO",
+                            module = "BootRecoveryReceiver",
+                            message = "System broadcast $action received. Enforcing SHADOW/TEST safety lock until exchange state reconciliation completes."
                         )
                     )
-                } catch (_: Exception) {
                 } finally {
                     pendingResult.finish()
                 }

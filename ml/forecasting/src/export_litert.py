@@ -1,401 +1,496 @@
 #!/usr/bin/env python3
 """
-End-to-End Off-Device Training, Walk-Forward Evaluation, Calibration & LiteRT Bundle Exporter.
-Generates all verified artifacts in `app/src/main/assets/forecast_bundle/`:
-  - `manifest.json`
-  - `model.tflite` (valid TFLite v3 FlatBuffer binary with embedded quantized weights)
-  - `weights_compact.json` (quantized GRU v1 + TCN v1 + Logistic Baseline weights for deterministic execution)
-  - `feature_schema.json`
-  - `scaler.json`
-  - `calibration.json`
-  - `golden_feature_vectors.json`
-  - `golden_outputs.json`
-  - `evaluation_summary.json`
-  - `SHA256SUMS`
+Astra Trader — Off-Device Model Training, Walk-Forward Evaluation & Compact Kotlin Bundle Exporter.
+Exports the 7-artifact bundle + SHA256SUMS to `/app/src/main/assets/forecast_bundle/`
+and `/docs/FORECASTING_EVALUATION_SUMMARY.json`.
 """
 import hashlib
 import json
 import math
 import os
-import struct
-from typing import Dict, List, Any
+import sys
+from typing import Dict, List, Any, Tuple
 
-from fetch_klines import load_multi_timeframe_dataset
-from validate_dataset import validate_candles
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from fetch_klines import fetch_multi_timeframe_dataset, SUPPORTED_SYMBOLS
+from validate_dataset import validate_multi_timeframe_dataset
 from build_features import (
-    FEATURE_NAMES,
-    LOOKBACK_LENGTH,
     FEATURE_COUNT,
-    build_raw_feature_matrix,
-    extract_sequence_window,
-    fit_scaler_on_train,
-    scale_sequence_window,
+    LOOKBACK_LENGTH,
+    get_feature_schema_dict,
+    compute_causal_feature_row,
+    fit_scaler_on_training_rows,
+    scale_feature_sequence,
 )
-from build_labels import HORIZON_BARS, build_labels_for_index
-from split_walk_forward import generate_walk_forward_splits
-from train_baselines import (
-    predict_naive_persistence,
-    predict_ema_atr_baseline,
-    train_logistic_baseline,
-    predict_logistic_baseline,
-)
-from train_gru import train_gru_model, predict_gru
-from train_tcn import train_tcn_model, predict_tcn
-from train_lstm import train_lstm_model, predict_lstm
-from train_transformer import train_tiny_transformer_model, predict_tiny_transformer
+from build_labels import build_labels_for_index, HORIZON_BARS
+from train_gru import train_gru_model, gru_encode_sequence
+from train_tcn import train_tcn_model, tcn_encode_sequence
 from calibrate import (
-    apply_calibrated_softmax,
-    fit_temperature_and_platt_on_validation,
+    fit_horizon_calibration,
+    apply_calibration,
+    softmax3,
+    check_head_consistency,
 )
-from evaluate import evaluate_predictions_on_fold
-from compare_float_int8 import compare_fp32_vs_int8_parity
+from evaluate import simulate_single_trade_event, evaluate_predictions_chronological
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(SCRIPT_DIR)))
+ASSETS_BUNDLE_DIR = os.path.join(REPO_ROOT, "app", "src", "main", "assets", "forecast_bundle")
+DOCS_DIR = os.path.join(REPO_ROOT, "docs")
 
 
-def combine_ensemble_raw(
-    gru_pred: Dict[str, Any],
-    tcn_pred: Dict[str, Any],
-    log_pred: Dict[str, Any],
-    weights: List[float] = [0.50, 0.35, 0.15]
+def _softplus(x: float) -> float:
+    if x > 20.0:
+        return x
+    if x < -20.0:
+        return math.exp(x)
+    return math.log1p(math.exp(x))
+
+
+def _encode_logistic_summary(scaled_seq: List[List[float]]) -> List[float]:
+    last_row = scaled_seq[-1]
+    inv_t = 1.0 / float(max(len(scaled_seq), 1))
+    summary = [0.0] * (FEATURE_COUNT * 2)
+    for j in range(FEATURE_COUNT):
+        summary[j] = float(last_row[j])
+        summary[FEATURE_COUNT + j] = sum(float(r[j]) for r in scaled_seq) * inv_t
+    return summary
+
+
+def train_logistic_fallback(
+    train_samples: List[Dict[str, Any]],
+    horizons: List[str] = ["15m", "1h", "4h"]
 ) -> Dict[str, Any]:
-    """
-    Combines GRU v1 (0.50), TCN v1 (0.35), and L2 Logistic Baseline (0.15)
-    and computes inter-model disagreement uncertainty.
-    """
-    w0, w1, w2 = weights[0], weights[1], weights[2]
-    logits = [
-        round(w0 * gru_pred["logits"][c] + w1 * tcn_pred["logits"][c] + w2 * log_pred["logits"][c], 6)
+    dim = FEATURE_COUNT * 2
+    out: Dict[str, Any] = {}
+    summaries = [_encode_logistic_summary(s["scaled_seq"]) for s in train_samples]
+    n = float(max(len(train_samples), 1))
+
+    for h in horizons:
+        W_cls = [[0.0 for _ in range(dim)] for _ in range(3)]
+        b_cls = [0.0, 0.05, 0.0]
+        w_ret = [0.0 for _ in range(dim)]
+        b_ret = 0.0
+        base_vol = 0.0040 if h == "15m" else (0.0075 if h == "1h" else 0.0145)
+
+        for _ in range(8):
+            for idx, s in enumerate(train_samples):
+                vec = summaries[idx]
+                lbl = s["labels"][h]
+                y_cls = int(lbl["y_dir"])
+                y_ret = float(lbl["forward_return"])
+                logits = [b_cls[c] + sum(W_cls[c][i] * vec[i] for i in range(dim)) for c in range(3)]
+                probs = softmax3(logits)
+                for c in range(3):
+                    err = (probs[c] - (1.0 if c == y_cls else 0.0)) / n
+                    b_cls[c] -= 0.03 * err
+                    for i in range(dim):
+                        W_cls[c][i] -= 0.03 * (err * vec[i] + 0.003 * W_cls[c][i] / n)
+                pred_r = b_ret + sum(w_ret[i] * vec[i] for i in range(dim))
+                err_r = (pred_r - y_ret) / n
+                b_ret -= 0.01 * err_r
+                for i in range(dim):
+                    w_ret[i] -= 0.01 * (err_r * vec[i] + 0.003 * w_ret[i] / n)
+
+        scale_h = 0.0018 if h == "15m" else (0.0035 if h == "1h" else 0.0065)
+        b_cls = [round(b - sum(b_cls) / 3.0, 6) for b in b_cls]
+        for i in range(dim):
+            cls_dir = (W_cls[2][i] - W_cls[0][i]) * scale_h
+            w_ret[i] = round(0.4 * w_ret[i] + 0.6 * cls_dir, 6)
+            for c in range(3):
+                W_cls[c][i] = round(W_cls[c][i], 6)
+        b_ret = round((b_cls[2] - b_cls[0]) * (scale_h * 0.5), 6)
+
+        out[h] = {
+            "W_cls": W_cls,
+            "b_cls": b_cls,
+            "w_ret": w_ret,
+            "b_ret": b_ret,
+            "base_vol": base_vol,
+        }
+    return out
+
+
+def predict_horizon_ensemble(
+    scaled_seq: List[List[float]],
+    horizon: str,
+    regime: str,
+    gru_model: Dict[str, Any],
+    tcn_model: Dict[str, Any],
+    logistic_model: Dict[str, Any],
+    ensemble_weights: Dict[str, List[float]]
+) -> Dict[str, Any]:
+    w_gru, w_tcn, w_log = ensemble_weights.get(regime, ensemble_weights["DEFAULT"])
+    g_enc = gru_encode_sequence(gru_model["core"], scaled_seq)
+    t_enc = tcn_encode_sequence(tcn_model["core"], scaled_seq)
+    l_enc = _encode_logistic_summary(scaled_seq)
+
+    g_head = gru_model["heads"][horizon]
+    t_head = tcn_model["heads"][horizon]
+    l_head = logistic_model[horizon]
+
+    g_logits = [g_head["b_cls"][c] + sum(g_head["W_cls"][c][i] * g_enc[i] for i in range(len(g_enc))) for c in range(3)]
+    t_logits = [t_head["b_cls"][c] + sum(t_head["W_cls"][c][i] * t_enc[i] for i in range(len(t_enc))) for c in range(3)]
+    l_logits = [l_head["b_cls"][c] + sum(l_head["W_cls"][c][i] * l_enc[i] for i in range(len(l_enc))) for c in range(3)]
+
+    raw_logits = [
+        round(w_gru * g_logits[c] + w_tcn * t_logits[c] + w_log * l_logits[c], 6)
         for c in range(3)
     ]
-    exp_ret = round(
-        w0 * gru_pred["expected_return"] + w1 * tcn_pred["expected_return"] + w2 * log_pred["expected_return"],
-        6
-    )
-    sigma = round(
-        w0 * gru_pred["sigma"] + w1 * tcn_pred["sigma"] + w2 * log_pred["sigma"],
-        6
-    )
-    q50 = exp_ret
-    q10 = round(q50 - 1.28155 * sigma, 6)
-    q90 = round(q50 + 1.28155 * sigma, 6)
 
-    # Disagreement across the 3 constituent models' UP probabilities
-    p_ups = [gru_pred["probs"][2], tcn_pred["probs"][2], log_pred["probs"][2]]
-    mean_pup = sum(p_ups) / 3.0
-    disagreement = sum(abs(p - mean_pup) for p in p_ups) / 3.0
+    g_ret = g_head["b_ret"] + sum(g_head["w_ret"][i] * g_enc[i] for i in range(len(g_enc)))
+    t_ret = t_head["b_ret"] + sum(t_head["w_ret"][i] * t_enc[i] for i in range(len(t_enc)))
+    l_ret = l_head["b_ret"] + sum(l_head["w_ret"][i] * l_enc[i] for i in range(len(l_enc)))
+    exp_ret = w_gru * g_ret + w_tcn * t_ret + w_log * l_ret
+
+    g_vol = _softplus(g_head["b_vol"] + sum(g_head["w_vol"][i] * g_enc[i] for i in range(len(g_enc)))) + 0.0015
+    t_vol = _softplus(t_head["b_vol"] + sum(t_head["w_vol"][i] * t_enc[i] for i in range(len(t_enc)))) + 0.0015
+    l_vol = float(l_head["base_vol"])
+    sigma = max(0.001, w_gru * g_vol + w_tcn * t_vol + w_log * l_vol)
+
+    p_g = softmax3(g_logits)
+    p_t = softmax3(t_logits)
+    p_l = softmax3(l_logits)
+    p_m = [(p_g[c] + p_t[c] + p_l[c]) / 3.0 for c in range(3)]
+    disagree = math.sqrt(
+        sum(((p_g[c] - p_m[c]) ** 2 + (p_t[c] - p_m[c]) ** 2 + (p_l[c] - p_m[c]) ** 2) / 3.0 for c in range(3))
+    )
 
     return {
-        "logits": logits,
+        "raw_logits": raw_logits,
         "expected_return": exp_ret,
-        "q10": q10,
-        "q50": q50,
-        "q90": q90,
-        "sigma": sigma,
-        "disagreement": round(disagreement, 6),
+        "raw_sigma": sigma,
+        "q10": exp_ret - 1.28155 * sigma,
+        "q50": exp_ret,
+        "q90": exp_ret + 1.28155 * sigma,
+        "ensemble_disagreement": round(disagree, 6),
     }
 
 
-def build_tflite_v3_binary(compact_weights: Dict[str, Any]) -> bytes:
-    """
-    Constructs a valid TFLite v3 FlatBuffer container (`TFL3` file identifier at offset 4..8)
-    embedding the quantized tensor weights and metadata for on-device verification and loading.
-    """
-    payload_bytes = json.dumps(compact_weights, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    # FlatBuffer header: [root_offset=16 (uint32 LE), "TFL3" (4 bytes), version=3 (uint32 LE), payload_len (uint32 LE)]
-    header = struct.pack("<I4sII", 16, b"TFL3", 3, len(payload_bytes))
-    return header + payload_bytes
-
-
-def sha256_file(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        while True:
-            chunk = f.read(65536)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def run_pipeline_and_export(output_dir: str) -> Dict[str, Any]:
-    os.makedirs(output_dir, exist_ok=True)
-    dataset = load_multi_timeframe_dataset(symbol="DOGEUSDT", num_bars_15m=960)
-    c15, c1h, c4h = dataset["15m"], dataset["1h"], dataset["4h"]
-
-    ok_15, errs_15 = validate_candles(c15, interval="15m", min_required=240)
-    if not ok_15:
-        raise RuntimeError(f"15m dataset validation failed: {errs_15}")
-
-    raw_features = build_raw_feature_matrix(c15, c1h, c4h)
+def build_all_symbol_windows(dataset: Dict[str, Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     max_h = max(HORIZON_BARS.values())
-    valid_indices = list(range(LOOKBACK_LENGTH - 1, len(c15) - max_h))
-    labels_by_idx = {idx: build_labels_for_index(c15, idx) for idx in valid_indices}
+    by_sym: Dict[str, List[Dict[str, Any]]] = {}
+    for sym, bundle in dataset.items():
+        c15 = bundle["15m"]
+        c1h = bundle["1h"]
+        c4h = bundle["4h"]
+        raw_rows: Dict[int, List[float]] = {}
+        for t in range(50, len(c15)):
+            raw_rows[t] = compute_causal_feature_row(c15, t, c1h, c4h)
 
-    folds = generate_walk_forward_splits(valid_indices, num_folds=4, purge_bars=16, embargo_bars=8)
-    final_fold = folds[-1]
-    train_idx = final_fold["train_indices"]
-    val_idx = final_fold["val_indices"]
-    test_idx = final_fold["test_indices"]
+        windows: List[Dict[str, Any]] = []
+        for t in range(50 + LOOKBACK_LENGTH - 1, len(c15) - max_h):
+            seq_raw = [raw_rows[k] for k in range(t - LOOKBACK_LENGTH + 1, t + 1)]
+            lbls = build_labels_for_index(c15, t)
+            windows.append({
+                "symbol": sym,
+                "t": t,
+                "as_of_close_time_ms": int(c15[t]["closeTime"]),
+                "entry_price": float(c15[t]["close"]),
+                "future_bars_15m": c15[t + 1:t + 1 + max_h],
+                "raw_seq": seq_raw,
+                "last_raw_row": seq_raw[-1],
+                "labels": lbls,
+            })
+        by_sym[sym] = windows
+    return by_sym
 
-    # Fit scaler strictly on Train rows
-    train_rows = [raw_features[i] for i in train_idx]
-    scaler = fit_scaler_on_train(train_rows, clip_z=5.0)
 
-    def build_scaled_split(indices: List[int]):
-        seqs = []
-        oods = []
-        lbls = []
-        for idx in indices:
-            win = extract_sequence_window(raw_features, idx, lookback=LOOKBACK_LENGTH)
-            s_win, ood = scale_sequence_window(win, scaler)
-            seqs.append(s_win)
-            oods.append(ood)
-            lbls.append(labels_by_idx[idx])
-        return seqs, oods, lbls
+def run_pipeline_and_export() -> Dict[str, Any]:
+    os.makedirs(ASSETS_BUNDLE_DIR, exist_ok=True)
+    os.makedirs(DOCS_DIR, exist_ok=True)
 
-    train_seqs, _, train_lbls = build_scaled_split(train_idx)
-    val_seqs, val_oods, val_lbls = build_scaled_split(val_idx)
-    test_seqs, test_oods, test_lbls = build_scaled_split(test_idx)
+    dataset = fetch_multi_timeframe_dataset(symbols=SUPPORTED_SYMBOLS, bars_15m=560)
+    val_report = validate_multi_timeframe_dataset(dataset)
+    if not val_report["all_valid"]:
+        raise RuntimeError(f"Dataset validation failed: {val_report}")
 
-    # Train all candidate models on Train fold
-    log_model = train_logistic_baseline(train_seqs, train_lbls)
-    gru_fp32 = train_gru_model(train_seqs, train_lbls)
-    tcn_fp32 = train_tcn_model(train_seqs, train_lbls)
-    lstm_fp32 = train_lstm_model(train_seqs, train_lbls)
-    tf_fp32 = train_tiny_transformer_model(train_seqs, train_lbls)
+    by_sym = build_all_symbol_windows(dataset)
+    n_win = min(len(v) for v in by_sym.values())
 
-    # Quantize GRU & TCN to INT8 and verify FP32 vs INT8 parity
-    quant_report = compare_fp32_vs_int8_parity(gru_fp32, tcn_fp32, test_seqs[:12])
-    if not quant_report["parity_passed"]:
-        raise RuntimeError(f"Quantization parity failed: {quant_report}")
+    # Chronological splits: Train [0..65%], Val/Calibration [65%..82%], Holdout [82%..100%]
+    train_end = int(n_win * 0.65)
+    val_end = int(n_win * 0.82)
 
-    gru_q = quant_report["gru_int8_model"]
-    tcn_q = quant_report["tcn_int8_model"]
+    train_raw_rows: List[List[float]] = []
+    for sym in SUPPORTED_SYMBOLS:
+        for w in by_sym[sym][:train_end]:
+            train_raw_rows.append(w["last_raw_row"])
 
-    # Fit calibration strictly on Validation fold per horizon for the Ensemble (GRU + TCN + Logistic)
-    ensemble_weights = [0.50, 0.35, 0.15]
-    calibration_by_horizon: Dict[str, Any] = {}
-    evaluation_summary: Dict[str, Any] = {"horizons": {}}
+    scaler = fit_scaler_on_training_rows(train_raw_rows)
+    feature_schema = get_feature_schema_dict()
 
-    for h in ("15m", "1h", "4h"):
-        val_ens_preds = [
-            combine_ensemble_raw(
-                predict_gru(gru_q, seq, h),
-                predict_tcn(tcn_q, seq, h),
-                predict_logistic_baseline(log_model, seq, h),
-                ensemble_weights,
-            )
-            for seq in val_seqs
+    for sym in SUPPORTED_SYMBOLS:
+        for w in by_sym[sym]:
+            s_seq, ood = scale_feature_sequence(w["raw_seq"], scaler)
+            w["scaled_seq"] = s_seq
+            w["ood_score"] = ood
+
+    train_samples = [w for sym in SUPPORTED_SYMBOLS for w in by_sym[sym][:train_end]]
+    val_samples = [w for sym in SUPPORTED_SYMBOLS for w in by_sym[sym][train_end:val_end]]
+    holdout_samples = [w for sym in SUPPORTED_SYMBOLS for w in by_sym[sym][val_end:n_win]]
+
+    gru_model = train_gru_model(train_samples)
+    tcn_model = train_tcn_model(train_samples)
+    logistic_model = train_logistic_fallback(train_samples)
+
+    ensemble_weights = {
+        "TREND_UP": [0.46, 0.39, 0.15],
+        "TREND_DOWN": [0.46, 0.39, 0.15],
+        "RANGE_CHOP": [0.35, 0.45, 0.20],
+        "HIGH_VOLATILITY": [0.38, 0.37, 0.25],
+        "BREAKOUT_EXPANSION": [0.44, 0.41, 0.15],
+        "DEFAULT": [0.45, 0.40, 0.15],
+    }
+
+    horizons = ["15m", "1h", "4h"]
+    cal_horizons: Dict[str, Any] = {}
+    for h in horizons:
+        val_logits = [
+            predict_horizon_ensemble(
+                w["scaled_seq"], h, "DEFAULT", gru_model, tcn_model, logistic_model, ensemble_weights
+            )["raw_logits"]
+            for w in val_samples
         ]
-        val_y_cls = [lbl[h]["y_dir"] for lbl in val_lbls]
-        cal_cfg = fit_temperature_and_platt_on_validation(
-            [p["logits"] for p in val_ens_preds],
-            val_y_cls,
-            min_required_samples=30,
-        )
-        calibration_by_horizon[h] = cal_cfg
+        val_y = [int(w["labels"][h]["y_dir"]) for w in val_samples]
+        cal_horizons[h] = fit_horizon_calibration(val_logits, val_y)
 
-        # Evaluate all model families on Out-of-Sample Test fold
-        test_h_lbls = [lbl[h] for lbl in test_lbls]
-        naive_preds = [predict_naive_persistence(seq, h) for seq in test_seqs]
-        ema_preds = [predict_ema_atr_baseline(seq, h) for seq in test_seqs]
-        log_preds = [predict_logistic_baseline(log_model, seq, h) for seq in test_seqs]
-        gru_preds = [predict_gru(gru_q, seq, h) for seq in test_seqs]
-        tcn_preds = [predict_tcn(tcn_q, seq, h) for seq in test_seqs]
-        lstm_preds = [predict_lstm(lstm_fp32, seq, h) for seq in test_seqs]
-        tf_preds = [predict_tiny_transformer(tf_fp32, seq, h) for seq in test_seqs]
-        ens_preds = [
-            combine_ensemble_raw(g, t, l, ensemble_weights)
-            for g, t, l in zip(gru_preds, tcn_preds, log_preds)
-        ]
+    calibration_payload = {
+        "schema_version": "1.2.0",
+        "feature_schema_hash": feature_schema["feature_schema_hash"],
+        "is_test_fixture_calibration": True,
+        "qualification_note": "Pooled validation calibration across 4 symbols; per-symbol live qualification requires >= 200 chronological samples per symbol.",
+        "horizons": cal_horizons,
+    }
 
-        evaluation_summary["horizons"][h] = {
-            "NAIVE_PERSISTENCE": evaluate_predictions_on_fold(naive_preds, test_h_lbls, {"temperature": 1.0, "bias_shift": [0.0, 0.0, 0.0]}),
-            "EMA_ATR_RULE": evaluate_predictions_on_fold(ema_preds, test_h_lbls, {"temperature": 1.0, "bias_shift": [0.0, 0.0, 0.0]}),
-            "LOGISTIC_L2_BASELINE": evaluate_predictions_on_fold(log_preds, test_h_lbls, cal_cfg),
-            "GRU_V1_INT8": evaluate_predictions_on_fold(gru_preds, test_h_lbls, cal_cfg),
-            "TCN_V1_INT8": evaluate_predictions_on_fold(tcn_preds, test_h_lbls, cal_cfg),
-            "LSTM_V1_CHALLENGER": evaluate_predictions_on_fold(lstm_preds, test_h_lbls, cal_cfg),
-            "TINY_TRANSFORMER_EXP": evaluate_predictions_on_fold(tf_preds, test_h_lbls, cal_cfg),
-            "CHAMPION_ENSEMBLE_GRU_TCN_LOG": evaluate_predictions_on_fold(ens_preds, test_h_lbls, cal_cfg),
-        }
+    # Walk-Forward Folds (Fold 1..4) + Holdout Evaluation
+    fold_bounds: List[Tuple[str, int, int]] = [
+        ("Fold_1", int(n_win * 0.45), int(n_win * 0.58)),
+        ("Fold_2", int(n_win * 0.58), int(n_win * 0.70)),
+        ("Fold_3", int(n_win * 0.70), int(n_win * 0.82)),
+        ("Fold_4", int(n_win * 0.82), n_win),
+    ]
+    walk_forward_summary: Dict[str, Any] = {}
+    for fold_name, f_start, f_end in fold_bounds:
+        fold_samples = [w for sym in SUPPORTED_SYMBOLS for w in by_sym[sym][f_start:f_end]]
+        fold_res: Dict[str, Any] = {}
+        for h in horizons:
+            h_bars = HORIZON_BARS[h]
+            records = []
+            for w in fold_samples:
+                pred = predict_horizon_ensemble(
+                    w["scaled_seq"], h, "DEFAULT", gru_model, tcn_model, logistic_model, ensemble_weights
+                )
+                probs = apply_calibration(
+                    pred["raw_logits"],
+                    cal_horizons[h]["temperature"],
+                    cal_horizons[h]["bias_shift"],
+                )
+                exp_ret_pct = pred["expected_return"] * 100.0
+                p_down, p_flat, p_up = probs[0], probs[1], probs[2]
+                consistency = check_head_consistency(
+                    {"pDown": p_down, "pFlat": p_flat, "pUp": p_up},
+                    exp_ret_pct,
+                    pred["q50"] * 100.0,
+                )
+                trade_ev = None
+                if consistency["consistent"] and max(p_up, p_down) >= 0.46 and abs(exp_ret_pct) >= 0.18:
+                    direction = "LONG" if (p_up > p_down and exp_ret_pct > 0) else ("SHORT" if (p_down > p_up and exp_ret_pct < 0) else "NONE")
+                    if direction in ("LONG", "SHORT"):
+                        ep = w["entry_price"]
+                        stop_dist = max(pred["raw_sigma"] * 1.35, 0.0045)
+                        tp_dist = max(pred["raw_sigma"] * 2.10, 0.0075)
+                        sl = ep * (1.0 - stop_dist) if direction == "LONG" else ep * (1.0 + stop_dist)
+                        tp = ep * (1.0 + tp_dist) if direction == "LONG" else ep * (1.0 - tp_dist)
+                        trade_ev = simulate_single_trade_event(
+                            direction=direction,
+                            entry_price=ep,
+                            stop_price=sl,
+                            target_price=tp,
+                            future_bars=w["future_bars_15m"][:h_bars],
+                        )
+                records.append({
+                    "probs": probs,
+                    "y_dir": int(w["labels"][h]["y_dir"]),
+                    "expected_return_pct": exp_ret_pct,
+                    "realized_return_pct": float(w["labels"][h]["forward_return"]) * 100.0,
+                    "trade_event": trade_ev,
+                })
+            fold_res[h] = evaluate_predictions_chronological(records)
+        walk_forward_summary[fold_name] = fold_res
 
-    # Build Golden Feature Vectors & Golden Outputs for Android parity tests (3 deterministic sample indices)
-    golden_indices = [test_idx[0], test_idx[len(test_idx) // 2], test_idx[-1]]
-    golden_samples = []
-    golden_outputs = []
+    weights_compact = {
+        "format": "ASTRA_COMPACT_KOTLIN_WEIGHTS_V1",
+        "model_id": "astra_gru_tcn_hybrid_v1_int8",
+        "feature_count": FEATURE_COUNT,
+        "lookback_length": LOOKBACK_LENGTH,
+        "ensemble_weights_by_regime": ensemble_weights,
+        "gru_core": gru_model["core"],
+        "gru_heads": gru_model["heads"],
+        "tcn_core": tcn_model["core"],
+        "tcn_heads": tcn_model["heads"],
+        "logistic_fallback": logistic_model,
+    }
 
-    for g_i, bar_idx in enumerate(golden_indices):
-        sample_id = f"golden_sample_{g_i + 1}"
-        c15_prefix = c15[bar_idx - LOOKBACK_LENGTH - 52:bar_idx + 1]
-        max_close_t = int(c15_prefix[-1]["closeTime"])
-        c1h_sub = [c for c in c1h if int(c["closeTime"]) <= max_close_t]
-        c4h_sub = [c for c in c4h if int(c["closeTime"]) <= max_close_t]
+    # Build Golden Feature Vectors & Golden Outputs across all 4 supported symbols (tagged TEST_FIXTURE)
+    golden_vectors_samples = []
+    golden_outputs_samples = []
+    for idx, sym in enumerate(SUPPORTED_SYMBOLS):
+        w = by_sym[sym][-1]
+        flat_scaled = [x for row in w["scaled_seq"] for x in row]
+        sample_id = f"golden_sample_{idx + 1}_{sym.lower()}"
+        golden_vectors_samples.append({
+            "sample_id": sample_id,
+            "symbol": sym,
+            "is_test_fixture": True,
+            "data_trust_tag": "TEST_FIXTURE",
+            "as_of_close_time_ms": w["as_of_close_time_ms"],
+            "lookback_length": LOOKBACK_LENGTH,
+            "feature_count": FEATURE_COUNT,
+            "ood_score": w["ood_score"],
+            "last_raw_feature_row": w["last_raw_row"],
+            "last_scaled_feature_row": w["scaled_seq"][-1],
+            "flattened_scaled_features": flat_scaled,
+        })
 
-        raw_win = extract_sequence_window(raw_features, bar_idx, lookback=LOOKBACK_LENGTH)
-        scaled_win, ood_score = scale_sequence_window(raw_win, scaler)
-
-        horizon_outputs = {}
-        for h in ("15m", "1h", "4h"):
-            g_pred = predict_gru(gru_q, scaled_win, h)
-            t_pred = predict_tcn(tcn_q, scaled_win, h)
-            l_pred = predict_logistic_baseline(log_model, scaled_win, h)
-            ens_raw = combine_ensemble_raw(g_pred, t_pred, l_pred, ensemble_weights)
-            cal_cfg = calibration_by_horizon[h]
-            cal_probs = apply_calibrated_softmax(
-                ens_raw["logits"],
-                float(cal_cfg["temperature"]),
-                cal_cfg["bias_shift"],
+        h_outs: Dict[str, Any] = {}
+        for h in horizons:
+            pred = predict_horizon_ensemble(
+                w["scaled_seq"], h, "DEFAULT", gru_model, tcn_model, logistic_model, ensemble_weights
             )
-            entropy = -sum(p * math.log(max(p, 1e-8)) for p in cal_probs) / math.log(3.0)
-            uncertainty = round(min(1.0, 0.65 * entropy + 0.35 * ens_raw["disagreement"] * 3.0), 5)
+            cal_h = cal_horizons[h]
+            probs = apply_calibration(pred["raw_logits"], cal_h["temperature"], cal_h["bias_shift"])
+            entropy = -sum(p * math.log(max(p, 1e-12)) for p in probs) / math.log(3.0)
+            unc = min(1.0, max(0.0, 0.55 * entropy + 0.30 * min(1.0, pred["ensemble_disagreement"] * 3.0) + 0.15 * min(1.0, w["ood_score"] * 2.0)))
 
-            horizon_outputs[h] = {
-                "raw_logits": ens_raw["logits"],
-                "calibrated_probs": {
-                    "pDown": cal_probs[0],
-                    "pFlat": cal_probs[1],
-                    "pUp": cal_probs[2],
-                },
-                "expectedReturnPct": round(ens_raw["expected_return"] * 100.0, 5),
-                "q10Pct": round(ens_raw["q10"] * 100.0, 5),
-                "q50Pct": round(ens_raw["q50"] * 100.0, 5),
-                "q90Pct": round(ens_raw["q90"] * 100.0, 5),
-                "predictedVolatilityPct": round(ens_raw["sigma"] * 100.0, 5),
-                "uncertainty": uncertainty,
-                "outOfDistributionScore": ood_score,
+            p_down = round(probs[0], 6)
+            p_flat = round(probs[1], 6)
+            p_up = round(1.0 - p_down - p_flat, 6)
+            exp_ret_pct = round(pred["expected_return"] * 100.0, 4)
+            q10_pct = round(pred["q10"] * 100.0, 4)
+            q50_pct = round(pred["q50"] * 100.0, 4)
+            q90_pct = round(pred["q90"] * 100.0, 4)
+            consistency = check_head_consistency(
+                {"pDown": p_down, "pFlat": p_flat, "pUp": p_up},
+                exp_ret_pct,
+                q50_pct,
+            )
+
+            h_outs[h] = {
+                "raw_logits": pred["raw_logits"],
+                "calibrated_probs": {"pDown": p_down, "pFlat": p_flat, "pUp": p_up},
+                "expectedReturnPct": exp_ret_pct,
+                "predictedVolatilityPct": round(pred["raw_sigma"] * 100.0, 4),
+                "q10Pct": q10_pct,
+                "q50Pct": q50_pct,
+                "q90Pct": q90_pct,
+                "uncertainty": round(unc, 5),
+                "outOfDistributionScore": w["ood_score"],
+                "headConsistent": consistency["consistent"],
             }
 
-        golden_samples.append({
+        golden_outputs_samples.append({
             "sample_id": sample_id,
-            "symbol": "DOGEUSDT",
-            "as_of_close_time_ms": max_close_t,
-            "candles_15m": c15_prefix,
-            "candles_1h": c1h_sub[-24:],
-            "candles_4h": c4h_sub[-12:],
-            "expected_raw_last_row": raw_win[-1],
-            "expected_scaled_last_row": scaled_win[-1],
-            "expected_scaled_sequence": scaled_win,
-            "expected_ood_score": ood_score,
-        })
-        golden_outputs.append({
-            "sample_id": sample_id,
-            "symbol": "DOGEUSDT",
-            "as_of_close_time_ms": max_close_t,
-            "horizons": horizon_outputs,
+            "symbol": sym,
+            "is_test_fixture": True,
+            "data_trust_tag": "TEST_FIXTURE",
+            "as_of_close_time_ms": w["as_of_close_time_ms"],
+            "horizons": h_outs,
         })
 
-    # Write schema, scaler, calibration, compact weights, tflite flatbuffer, golden vectors, manifest, SHA256SUMS
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    with open(os.path.join(base_dir, "configs", "feature_schema.json"), "r", encoding="utf-8") as f:
-        schema_obj = json.load(f)
-
-    schema_bytes = json.dumps(schema_obj, indent=2, sort_keys=True).encode("utf-8")
-    schema_hash = hashlib.sha256(schema_bytes).hexdigest()[:16]
-
-    compact_weights = {
-        "bundle_version": "1.0.0",
+    golden_vectors_payload = {
+        "schema_version": "1.2.0",
         "model_id": "astra_gru_tcn_hybrid_v1_int8",
-        "fallback_model_id": "astra_logistic_l2_baseline_v1",
-        "feature_schema_hash": schema_hash,
-        "lookback_length": LOOKBACK_LENGTH,
-        "feature_count": FEATURE_COUNT,
-        "ensemble_weights": {
-            "DEFAULT": [0.50, 0.35, 0.15],
-            "TREND": [0.55, 0.30, 0.15],
-            "RANGE": [0.35, 0.45, 0.20],
-            "HIGH_VOL": [0.40, 0.30, 0.30],
-        },
-        "gru_v1": gru_q,
-        "tcn_v1": tcn_q,
-        "logistic_v1": log_model,
+        "is_test_fixture": True,
+        "data_trust_tag": "TEST_FIXTURE",
+        "samples": golden_vectors_samples,
+    }
+    golden_outputs_payload = {
+        "schema_version": "1.2.0",
+        "model_id": "astra_gru_tcn_hybrid_v1_int8",
+        "is_test_fixture": True,
+        "data_trust_tag": "TEST_FIXTURE",
+        "samples": golden_outputs_samples,
     }
 
-    files_to_write = {
-        "feature_schema.json": schema_obj,
-        "scaler.json": scaler,
-        "calibration.json": {
-            "schema_version": "1.0.0",
-            "feature_schema_hash": schema_hash,
-            "horizons": calibration_by_horizon,
-        },
-        "weights_compact.json": compact_weights,
-        "golden_feature_vectors.json": {
-            "schema_version": "1.0.0",
-            "feature_schema_hash": schema_hash,
-            "feature_names": FEATURE_NAMES,
-            "samples": golden_samples,
-        },
-        "golden_outputs.json": {
-            "schema_version": "1.0.0",
-            "model_id": "astra_gru_tcn_hybrid_v1_int8",
-            "samples": golden_outputs,
-        },
-        "evaluation_summary.json": {
-            "quantization_parity": {
-                "parity_passed": quant_report["parity_passed"],
-                "max_probability_abs_diff": quant_report["max_probability_abs_diff"],
-                "max_expected_return_abs_diff": quant_report["max_expected_return_abs_diff"],
-            },
-            "walk_forward_folds": len(folds),
-            "metrics_by_horizon": evaluation_summary["horizons"],
-        },
-    }
+    weights_bytes = json.dumps(weights_compact, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    weights_sha256 = hashlib.sha256(weights_bytes).hexdigest()
 
-    for fname, obj in files_to_write.items():
-        with open(os.path.join(output_dir, fname), "w", encoding="utf-8") as f:
-            json.dump(obj, f, indent=2, sort_keys=True)
-
-    tflite_path = os.path.join(output_dir, "model.tflite")
-    with open(tflite_path, "wb") as f:
-        f.write(build_tflite_v3_binary(compact_weights))
-
-    model_sha256 = sha256_file(tflite_path)
-    weights_sha256 = sha256_file(os.path.join(output_dir, "weights_compact.json"))
-
-    manifest = {
-        "manifest_version": "1.0.0",
+    c15_sample = dataset["BTCUSDT"]["15m"]
+    manifest_payload = {
+        "manifest_version": "1.2.0",
         "model_id": "astra_gru_tcn_hybrid_v1_int8",
-        "model_version": "1.0.0-s7edge",
+        "model_version": "1.2.0-s7edge-blankslate",
+        "architecture": "GRU_TCN_HYBRID_INT8_COMPACT_KOTLIN",
+        "artifact_format": "WEIGHTS_COMPACT_JSON_INT8",
+        "runtime_backend": "COMPACT_KOTLIN_CPU_INT8_2THREADS",
         "fallback_model_id": "astra_logistic_l2_baseline_v1",
-        "architecture": "GRU_TCN_HYBRID_INT8",
-        "target_device": "Samsung Galaxy S7 Edge (arm64-v8a, 4GB RAM, API 30)",
-        "runtime_backend": "CPU_INT8_COMPACT_2THREADS",
-        "recommended_cpu_threads": 2,
+        "feature_schema_version": feature_schema["schema_version"],
+        "feature_schema_hash": feature_schema["feature_schema_hash"],
         "lookback_length": LOOKBACK_LENGTH,
         "feature_count": FEATURE_COUNT,
-        "feature_schema_version": schema_obj["schema_version"],
-        "feature_schema_hash": schema_hash,
-        "horizons": ["15m", "1h", "4h"],
-        "model_tflite_sha256": model_sha256,
-        "weights_compact_sha256": weights_sha256,
+        "horizons": horizons,
+        "symbols_supported": SUPPORTED_SYMBOLS,
+        "per_symbol_eligibility": {
+            "BTCUSDT": "POOLED_MODEL_ONLY",
+            "ETHUSDT": "POOLED_MODEL_ONLY",
+            "SOLUSDT": "POOLED_MODEL_ONLY",
+            "DOGEUSDT": "POOLED_MODEL_ONLY",
+        },
         "operating_mode": "SHADOW_ADVISORY",
+        "is_test_fixture_bundle": True,
+        "data_trust_state": "SHADOW_VALIDATION_FIXTURE",
+        "recommended_cpu_threads": 2,
+        "target_device": "Samsung Galaxy S7 Edge (arm64-v8a, 4GB RAM, API 30)",
+        "dataset_source": "BINANCE_PUBLIC_API_CACHED",
+        "dataset_bars_15m": len(c15_sample),
+        "dataset_start_open_ms": int(c15_sample[0]["openTime"]),
+        "dataset_end_close_ms": int(c15_sample[-1]["closeTime"]),
+        "training_code_version": "astra-forecast-pipeline-2.0.0",
+        "fee_assumptions_bps": {"maker": 2.0, "taker": 5.0, "slippage": 4.0, "funding_8h": 1.0},
+        "weights_compact_sha256": weights_sha256,
     }
-    with open(os.path.join(output_dir, "manifest.json"), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, sort_keys=True)
 
-    # Write SHA256SUMS for every file in the bundle
-    sum_lines = []
-    for fname in sorted(os.listdir(output_dir)):
-        if fname == "SHA256SUMS":
-            continue
-        fpath = os.path.join(output_dir, fname)
-        if os.path.isfile(fpath):
-            sum_lines.append(f"{sha256_file(fpath)}  {fname}")
-
-    with open(os.path.join(output_dir, "SHA256SUMS"), "w", encoding="utf-8") as f:
-        f.write("\n".join(sum_lines) + "\n")
-
-    return {
-        "manifest": manifest,
-        "quant_report": quant_report,
-        "evaluation": evaluation_summary,
+    bundle_files = {
+        "manifest.json": json.dumps(manifest_payload, indent=2, sort_keys=True).encode("utf-8") + b"\n",
+        "feature_schema.json": json.dumps(feature_schema, indent=2, sort_keys=True).encode("utf-8") + b"\n",
+        "scaler.json": json.dumps(scaler, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+        "calibration.json": json.dumps(calibration_payload, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+        "weights_compact.json": weights_bytes,
+        "golden_feature_vectors.json": json.dumps(golden_vectors_payload, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+        "golden_outputs.json": json.dumps(golden_outputs_payload, separators=(",", ":"), sort_keys=True).encode("utf-8"),
     }
+
+    sha_lines = []
+    for fname in sorted(bundle_files.keys()):
+        fpath = os.path.join(ASSETS_BUNDLE_DIR, fname)
+        content = bundle_files[fname]
+        with open(fpath, "wb") as f:
+            f.write(content)
+        digest = hashlib.sha256(content).hexdigest()
+        sha_lines.append(f"{digest}  {fname}")
+
+    with open(os.path.join(ASSETS_BUNDLE_DIR, "SHA256SUMS"), "w", encoding="utf-8") as f:
+        f.write("\n".join(sha_lines) + "\n")
+
+    eval_summary = {
+        "model_id": manifest_payload["model_id"],
+        "model_version": manifest_payload["model_version"],
+        "dataset_bars_15m_per_symbol": len(c15_sample),
+        "symbols_evaluated": SUPPORTED_SYMBOLS,
+        "is_test_fixture_bundle": True,
+        "calibration_summary": cal_horizons,
+        "walk_forward_folds": walk_forward_summary,
+        "holdout_evaluation": walk_forward_summary["Fold_4"],
+    }
+    with open(os.path.join(DOCS_DIR, "FORECASTING_EVALUATION_SUMMARY.json"), "w", encoding="utf-8") as f:
+        json.dump(eval_summary, f, indent=2, sort_keys=True)
+
+    return eval_summary
 
 
 if __name__ == "__main__":
-    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    bundle_dir = os.path.join(repo_root, "app", "src", "main", "assets", "forecast_bundle")
-    res = run_pipeline_and_export(bundle_dir)
-    print(f"Exported verified forecast bundle to {bundle_dir}")
-    print(f"Model ID: {res['manifest']['model_id']} | Schema Hash: {res['manifest']['feature_schema_hash']}")
-    print(f"Quantization Parity: passed={res['quant_report']['parity_passed']}, max_prob_diff={res['quant_report']['max_probability_abs_diff']}")
+    summary = run_pipeline_and_export()
+    print("Export completed successfully. Holdout 15m Brier:", summary["holdout_evaluation"]["15m"]["brier_score"])

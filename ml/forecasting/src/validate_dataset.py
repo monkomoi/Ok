@@ -1,57 +1,79 @@
 #!/usr/bin/env python3
 """
-Strict dataset validator for Astra Trader V5.1 Forecasting Engine.
-Rejects non-monotonic timestamps, unclosed bars, timestamp gaps, non-positive OHLC, or NaN/Inf.
+Dataset quality & provenance validator for Astra Trader forecasting pipeline.
+Enforces:
+  - strictly monotonic timestamps with zero missing bars
+  - closed-candle invariant (isClosed == True)
+  - UTC boundary alignment for 15m, 1h, and 4h candles
+  - OHLCV integrity (low <= open/close <= high, volume >= 0)
+  - explicit provenance fields
 """
-import math
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any
 
-EXPECTED_STEP_MS = {
-    "15m": 15 * 60 * 1000,
-    "1h": 60 * 60 * 1000,
-    "4h": 4 * 60 * 60 * 1000,
+INTERVAL_MS = {
+    "15m": 900_000,
+    "1h": 3_600_000,
+    "4h": 14_400_000,
 }
 
 
-def validate_candles(
-    candles: List[Dict[str, Any]],
-    interval: str = "15m",
-    min_required: int = 80
-) -> Tuple[bool, List[str]]:
+def validate_candles(candles: List[Dict[str, Any]], expected_interval: str) -> Dict[str, Any]:
     errors: List[str] = []
-    if len(candles) < min_required:
-        errors.append(f"INSUFFICIENT_DATA: got {len(candles)} bars, need >= {min_required}")
-        return False, errors
+    step_ms = INTERVAL_MS.get(expected_interval)
+    if step_ms is None:
+        return {"valid": False, "errors": [f"Unsupported interval: {expected_interval}"]}
+    if not candles:
+        return {"valid": False, "errors": ["Empty candle list"]}
 
-    step_ms = EXPECTED_STEP_MS.get(interval, 15 * 60 * 1000)
-    prev_open = None
+    for i, bar in enumerate(candles):
+        open_t = int(bar.get("openTime", -1))
+        close_t = int(bar.get("closeTime", -1))
+        if open_t % step_ms != 0:
+            errors.append(f"Bar {i} openTime {open_t} not aligned to {expected_interval} boundary ({step_ms}ms)")
+        if close_t - open_t != step_ms - 1:
+            errors.append(f"Bar {i} closeTime {close_t} != openTime + {step_ms - 1}")
+        if not bool(bar.get("isClosed", False)):
+            errors.append(f"Bar {i} is not closed")
+        if i > 0:
+            prev_open = int(candles[i - 1]["openTime"])
+            if open_t - prev_open != step_ms:
+                errors.append(f"Gap or duplicate at index {i}: delta={open_t - prev_open}ms")
+        o, h, l, c, v = (
+            float(bar["open"]),
+            float(bar["high"]),
+            float(bar["low"]),
+            float(bar["close"]),
+            float(bar["volume"]),
+        )
+        if l <= 0 or o <= 0 or h <= 0 or c <= 0:
+            errors.append(f"Non-positive OHLC at index {i}")
+        if h < max(o, c, l) - 1e-9 or l > min(o, c, h) + 1e-9:
+            errors.append(f"OHLC envelope violated at index {i}")
+        if v < 0:
+            errors.append(f"Negative volume at index {i}")
 
-    for idx, c in enumerate(candles):
-        if not c.get("isClosed", False):
-            errors.append(f"UNCLOSED_BAR at index {idx}")
-        open_t = int(c["openTime"])
-        close_t = int(c["closeTime"])
-        if close_t <= open_t:
-            errors.append(f"INVALID_BAR_TIME at index {idx}: openTime={open_t}, closeTime={close_t}")
-        if prev_open is not None:
-            if open_t <= prev_open:
-                errors.append(f"NON_MONOTONIC_OR_DUPLICATE_TIME at index {idx}: {open_t} <= {prev_open}")
-            elif (open_t - prev_open) != step_ms:
-                errors.append(f"TIMESTAMP_GAP at index {idx}: delta={open_t - prev_open} != {step_ms}")
-        prev_open = open_t
+    return {
+        "valid": len(errors) == 0,
+        "bar_count": len(candles),
+        "interval": expected_interval,
+        "errors": errors,
+    }
 
-        for field in ("open", "high", "low", "close", "volume"):
-            val = float(c[field])
-            if math.isnan(val) or math.isinf(val):
-                errors.append(f"NAN_OR_INF_{field.upper()} at index {idx}")
-            if field != "volume" and val <= 0.0:
-                errors.append(f"NON_POSITIVE_{field.upper()} at index {idx}: {val}")
-            if field == "volume" and val < 0.0:
-                errors.append(f"NEGATIVE_VOLUME at index {idx}: {val}")
 
-        if float(c["high"]) < max(float(c["open"]), float(c["close"])) - 1e-9:
-            errors.append(f"HIGH_BELOW_BODY at index {idx}")
-        if float(c["low"]) > min(float(c["open"]), float(c["close"])) + 1e-9:
-            errors.append(f"LOW_ABOVE_BODY at index {idx}")
-
-    return len(errors) == 0, errors
+def validate_multi_timeframe_dataset(dataset: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    report: Dict[str, Any] = {"all_valid": True, "symbols": {}}
+    for sym, bundle in dataset.items():
+        r15 = validate_candles(bundle.get("15m", []), "15m")
+        r1h = validate_candles(bundle.get("1h", []), "1h")
+        r4h = validate_candles(bundle.get("4h", []), "4h")
+        sym_ok = r15["valid"] and r1h["valid"] and r4h["valid"]
+        if not sym_ok:
+            report["all_valid"] = False
+        report["symbols"][sym] = {
+            "valid": sym_ok,
+            "source": bundle.get("source", "UNKNOWN"),
+            "15m": r15,
+            "1h": r1h,
+            "4h": r4h,
+        }
+    return report

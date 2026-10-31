@@ -2,36 +2,29 @@ package com.example.ui.screens
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
-import com.example.R
-import com.example.data.local.AiRequestEntity
-import com.example.data.local.MarketFeatureEntity
-import com.example.data.local.RiskEventEntity
-import com.example.data.local.SystemEventEntity
+import com.example.data.local.RiskLogEntity
+import com.example.data.local.SystemLogEntity
 import com.example.ui.theme.AstraAmberWarn
 import com.example.ui.theme.AstraCrimsonDanger
 import com.example.ui.theme.AstraCyanAccent
@@ -44,190 +37,123 @@ import java.util.Locale
 
 @Composable
 fun SystemLogsTabScreen(
-    riskEvents: List<RiskEventEntity>,
-    systemEvents: List<SystemEventEntity>,
-    marketFeatures: List<MarketFeatureEntity> = emptyList(),
-    aiRequests: List<AiRequestEntity> = emptyList()
+    systemLogs: List<SystemLogEntity>,
+    riskLogs: List<RiskLogEntity>,
+    onPruneLogs: () -> Unit
 ) {
-    var selectedCategory by remember { mutableStateOf("ALL") }
-    val categories = listOf("ALL", "RECONCILE", "EXECUTION", "SECURITY", "THERMAL")
-    val timeFormatter = remember { SimpleDateFormat("HH:mm:ss dd/MM", Locale.getDefault()) }
+    val timeFormatter = remember { SimpleDateFormat("HH:mm:ss dd/MM", Locale.US) }
 
-    Column(
+    LazyColumn(
         modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp)
+            .padding(horizontal = 14.dp, vertical = 10.dp)
+            .testTag("system_logs_list"),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        // 1. Operational Reality & Risk Disclaimer Card (Section 0.1.10 & Section 1.2)
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = AstraSurfaceCard)
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = AstraSurfaceCard)
             ) {
-                Text(
-                    text = "Tuyên bố Giới hạn Vận hành & Rủi ro Thực tế (Mục 1.2 & 15.1)",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = AstraAmberWarn
-                )
-                Text(
-                    text = stringResource(R.string.disclaimer_no_guarantee),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                Text(
-                    text = "Kiểm toán 17 bảng Room (MOD-02): Đã ghi nhận ${marketFeatures.size} bản ghi market_features & ${aiRequests.size} bản ghi ai_requests (đã che bí mật).",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = AstraCyanAccent
-                )
-            }
-        }
-
-        // 2. Risk & Circuit Breaker Timeline
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = AstraSurfaceCard)
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text(
-                    text = "Sự kiện Rủi ro & Circuit Breaker (${riskEvents.size})",
-                    style = MaterialTheme.typography.titleMedium
-                )
-                if (riskEvents.isEmpty()) {
-                    Text(
-                        text = "Chưa có vi phạm rủi ro hay Circuit Breaker nào kích hoạt.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = AstraEmeraldGreen
-                    )
-                } else {
-                    riskEvents.take(10).forEach { ev ->
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(MaterialTheme.colorScheme.surface)
-                                .border(1.dp, AstraSurfaceOutline, RoundedCornerShape(10.dp))
-                                .padding(10.dp),
-                            verticalArrangement = Arrangement.spacedBy(2.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(
-                                    text = "[${ev.severity}] ${ev.triggerCode}",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = if (ev.severity == "CRITICAL") AstraCrimsonDanger else AstraAmberWarn
-                                )
-                                Text(
-                                    text = timeFormatter.format(Date(ev.occurredAtMs)),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                            Text(
-                                text = ev.actionTaken,
-                                style = MaterialTheme.typography.bodySmall,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Text(
-                                text = ev.detailVi,
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        // 3. System Audit Timeline (MOD-02 / Section 12.5 — Redacted of all secrets)
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = AstraSurfaceCard)
-        ) {
-            Column(
-                modifier = Modifier.padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text(
-                    text = "Nhật ký Hệ thống & Đối soát (Đã làm sạch chữ ký/Secret)",
-                    style = MaterialTheme.typography.titleMedium
-                )
-
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        .padding(14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    categories.forEach { cat ->
-                        FilterChip(
-                            selected = selectedCategory == cat,
-                            onClick = { selectedCategory = cat },
-                            label = { Text(cat, style = MaterialTheme.typography.labelSmall) }
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Structured Audit & Risk Telemetry",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        Text(
+                            text = "System Logs: ${systemLogs.size} · Risk Events: ${riskLogs.size}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
-                }
-
-                val filtered = if (selectedCategory == "ALL") {
-                    systemEvents
-                } else {
-                    systemEvents.filter { it.category == selectedCategory }
-                }
-
-                if (filtered.isEmpty()) {
-                    Text(
-                        text = "Không có bản ghi nhật ký trong nhóm $selectedCategory.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                } else {
-                    filtered.take(25).forEach { sys ->
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(MaterialTheme.colorScheme.surface)
-                                .padding(10.dp),
-                            verticalArrangement = Arrangement.spacedBy(3.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween
-                            ) {
-                                Text(
-                                    text = "[${sys.category} · ${sys.level}] ${sys.titleVi}",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = when (sys.level) {
-                                        "ERROR" -> AstraCrimsonDanger
-                                        "WARN" -> AstraAmberWarn
-                                        else -> AstraCyanAccent
-                                    }
-                                )
-                                Text(
-                                    text = timeFormatter.format(Date(sys.occurredAtMs)),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                            Text(
-                                text = sys.detailVi,
-                                style = MaterialTheme.typography.bodySmall
-                            )
-                        }
+                    OutlinedButton(
+                        onClick = onPruneLogs,
+                        modifier = Modifier.testTag("prune_logs_button")
+                    ) {
+                        Text("Prune Old")
                     }
                 }
+            }
+        }
+
+        if (riskLogs.isNotEmpty()) {
+            item {
+                Text(
+                    text = "Risk & Kill-Switch Events",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = AstraAmberWarn
+                )
+            }
+            items(riskLogs.take(20), key = { "risk_${it.id}" }) { rLog ->
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(AstraSurfaceCard)
+                        .border(1.dp, AstraCrimsonDanger.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = "[${rLog.severity}] ${rLog.eventType} · ${timeFormatter.format(Date(rLog.timestamp))}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = AstraCrimsonDanger
+                    )
+                    Text(
+                        text = rLog.description,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "Action: ${rLog.actionTaken}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = AstraCyanAccent
+                    )
+                }
+            }
+        }
+
+        item {
+            Text(
+                text = "System & Forecast Runtime Logs",
+                style = MaterialTheme.typography.labelLarge,
+                color = AstraCyanAccent
+            )
+        }
+
+        items(systemLogs, key = { "sys_${it.id}" }) { log ->
+            val levelColor = when (log.level) {
+                "ERROR", "CRITICAL" -> AstraCrimsonDanger
+                "WARN" -> AstraAmberWarn
+                else -> AstraEmeraldGreen
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(AstraSurfaceCard)
+                    .border(1.dp, AstraSurfaceOutline, RoundedCornerShape(10.dp))
+                    .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Text(
+                    text = "[${log.level}] ${log.module} · ${timeFormatter.format(Date(log.timestamp))}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = levelColor
+                )
+                Text(
+                    text = log.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
     }

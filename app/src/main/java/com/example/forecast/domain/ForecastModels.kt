@@ -1,159 +1,170 @@
 package com.example.forecast.domain
 
-import java.math.BigDecimal
+import com.example.domain.DataTrustState
+import com.example.domain.SymbolModelEligibility
+import kotlinx.serialization.Serializable
 
-/**
- * Domain contracts for the On-Device Time-Series Forecasting Engine (Section 11.2).
- */
+enum class ForecastStatus {
+    VALID,
+    WARMUP,
+    STALE_FEED,
+    OUT_OF_DISTRIBUTION,
+    MODEL_MISMATCH,
+    TIMEOUT,
+    LOW_CONFIDENCE,
+    DEGRADED_SHADOW_ONLY,
+    HEAD_INCONSISTENT,
+    INSUFFICIENT_CALIBRATION_SAMPLE
+}
+
+enum class ForecastOperatingMode {
+    DISABLED,
+    SHADOW,
+    GATED_ENFORCEMENT,
+    ADAPTIVE_SIZING
+}
+
+@Serializable
 data class ForecastModelBundle(
     val modelId: String,
     val modelVersion: String,
-    val fallbackModelId: String,
     val architecture: String,
-    val lookbackLength: Int,
+    val artifactFormat: String = "WEIGHTS_COMPACT_JSON_INT8",
+    val sequenceLength: Int,
     val featureCount: Int,
-    val featureSchemaVersion: String,
     val featureSchemaHash: String,
-    val horizons: List<String>,
-    val runtimeBackend: String,
-    val recommendedCpuThreads: Int,
-    val modelTfliteSha256: String,
+    val scalerHash: String,
+    val calibrationHash: String,
     val weightsCompactSha256: String,
-    val verifiedChecksumOk: Boolean,
-    val goldenSelfTestPassed: Boolean
+    val goldenVectorsSha256: String,
+    val goldenOutputsSha256: String,
+    val createdTimestampUtc: String,
+    val trainWindowUtc: List<String>,
+    val valWindowUtc: List<String>,
+    val testWindowUtc: List<String>,
+    val supportedSymbols: List<String>,
+    val symbolEligibility: Map<String, String> = emptyMap(),
+    val horizonsMinutes: List<Int>,
+    val quantization: String,
+    val minConfidenceThreshold: Double,
+    val maxEntropyThreshold: Double,
+    val maxOodScoreThreshold: Double,
+    val dataTrustTag: String = "TEST_FIXTURE"
 )
 
 data class ForecastTensorInput(
     val symbol: String,
-    val baseTimeframe: String,
-    val asOfCloseTimeMs: Long,
-    val lookbackLength: Int,
+    val asOfTimestampMs: Long,
+    val sequenceLength: Int,
     val featureCount: Int,
-    val featureSchemaHash: String,
-    val flattenedScaledFeatures: FloatArray,
-    val lastRawFeatureRow: FloatArray,
-    val lastScaledFeatureRow: FloatArray,
-    val outOfDistributionScore: Float
-) {
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is ForecastTensorInput) return false
-        return symbol == other.symbol &&
-            baseTimeframe == other.baseTimeframe &&
-            asOfCloseTimeMs == other.asOfCloseTimeMs &&
-            lookbackLength == other.lookbackLength &&
-            featureCount == other.featureCount &&
-            featureSchemaHash == other.featureSchemaHash &&
-            flattenedScaledFeatures.contentEquals(other.flattenedScaledFeatures)
-    }
+    val flattenedSequence: FloatArray,
+    val rawLatestFeatures: DoubleArray,
+    val oodAnomalyScore: Double,
+    val staleBarsCount: Int,
+    val isWarmupComplete: Boolean
+)
 
-    override fun hashCode(): Int {
-        var result = symbol.hashCode()
-        result = 31 * result + asOfCloseTimeMs.hashCode()
-        result = 31 * result + flattenedScaledFeatures.contentHashCode()
-        return result
-    }
-}
+data class RawHorizonOutput(
+    val horizonMinutes: Int,
+    val rawLogits: DoubleArray, // [down, flat, up]
+    val expectedReturnPct: Double,
+    val q10Pct: Double,
+    val q50Pct: Double,
+    val q90Pct: Double,
+    val epistemicUncertainty: Double
+)
 
 data class RawForecastOutput(
-    val horizon: String,
-    val rawLogits: FloatArray, // [logitDown, logitFlat, logitUp]
-    val expectedReturn: Float, // log return (e.g. 0.0042 = +0.42%)
-    val q10: Float,
-    val q50: Float,
-    val q90: Float,
-    val rawSigma: Float,
-    val ensembleDisagreement: Float = 0f,
-    val inferenceLatencyMs: Long = 0L
-) {
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is RawForecastOutput) return false
-        return horizon == other.horizon &&
-            rawLogits.contentEquals(other.rawLogits) &&
-            expectedReturn == other.expectedReturn &&
-            q10 == other.q10 &&
-            q50 == other.q50 &&
-            q90 == other.q90 &&
-            rawSigma == other.rawSigma
-    }
-
-    override fun hashCode(): Int {
-        var result = horizon.hashCode()
-        result = 31 * result + rawLogits.contentHashCode()
-        result = 31 * result + expectedReturn.hashCode()
-        return result
-    }
-}
-
-data class ForecastResult(
-    val predictionId: String,
+    val modelId: String,
+    val modelVersion: String,
     val symbol: String,
-    val baseTimeframe: String,
-    val horizon: String, // "15m" | "1h" | "4h"
-    val generatedAtMs: Long,
-    val validUntilMs: Long,
-    val status: ForecastStatus,
+    val asOfTimestampMs: Long,
+    val inferenceLatencyMs: Long,
+    val horizonOutputs: Map<Int, RawHorizonOutput>
+)
+
+@Serializable
+data class HorizonForecast(
+    val horizonMinutes: Int,
+    val pDown: Double,
+    val pFlat: Double,
+    val pUp: Double,
+    val calibratedLogits: List<Double>,
+    val expectedReturnPct: Double,
+    val q10Pct: Double,
+    val q50Pct: Double,
+    val q90Pct: Double,
+    val intervalWidthPct: Double,
+    val shannonEntropy: Double,
+    val normalizedConfidence: Double,
+    val calibrationBrierScore: Double,
+    val calibrationEce: Double,
+    val calibrationSampleSize: Int = 0,
+    val calibrationQualificationStatus: String = "INSUFFICIENT_SAMPLE_SHADOW_ONLY",
+    val headConsistent: Boolean = true,
+    val headInconsistencyReason: String = "OK"
+)
+
+@Serializable
+data class ForecastResult(
+    val symbol: String,
+    val asOfTimestampMs: Long,
     val modelId: String,
     val modelVersion: String,
     val featureSchemaHash: String,
-    val pUp: BigDecimal?,
-    val pDown: BigDecimal?,
-    val pFlat: BigDecimal?,
-    val expectedReturnPct: BigDecimal?,
-    val q10Pct: BigDecimal?,
-    val q50Pct: BigDecimal?,
-    val q90Pct: BigDecimal?,
-    val predictedVolatilityPct: BigDecimal?,
-    val uncertainty: BigDecimal?,
-    val outOfDistributionScore: BigDecimal?,
-    val calibrationApplied: Boolean,
-    val calibrationMethod: String,
-    val calibrationSampleSize: Int,
-    val brierScore: BigDecimal?,
-    val expectedCalibrationError: BigDecimal?,
-    val costThresholdPct: BigDecimal,
-    val passesQualityGate: Boolean,
-    val advisoryAction: String, // "ALLOW_CANDIDATE" | "ABSTAIN_NO_EDGE" | "VETO_OPPOSITE_DIRECTION" | "SHADOW_OBSERVE_ONLY"
-    val reasonVi: String,
-    val inferenceLatencyMs: Long
-) {
-    fun isExpired(nowMs: Long): Boolean = nowMs > validUntilMs
-}
-
-data class MultiHorizonForecastReport(
-    val symbol: String,
-    val asOfCloseTimeMs: Long,
-    val generatedAtMs: Long,
+    val status: ForecastStatus,
+    val statusReason: String,
     val operatingMode: ForecastOperatingMode,
-    val overallStatus: ForecastStatus,
-    val horizonResults: Map<String, ForecastResult>,
-    val primaryResult15m: ForecastResult?,
-    val summaryVi: String
+    val symbolEligibility: SymbolModelEligibility = SymbolModelEligibility.BASELINE_ONLY,
+    val horizons: Map<Int, HorizonForecast>,
+    val compositeDirectionalScore: Double,
+    val compositeConfidence: Double,
+    val uncertaintyScore: Double,
+    val oodScore: Double,
+    val driftScore: Double,
+    val headConsistent: Boolean,
+    val inferenceLatencyMs: Long,
+    val positionSizingMultiplier: Double,
+    val allowTradeExecution: Boolean
+)
+
+@Serializable
+data class MultiHorizonForecastReport(
+    val generatedAtMs: Long,
+    val activeModelId: String,
+    val activeModelVersion: String,
+    val operatingMode: ForecastOperatingMode,
+    val dataTrustState: DataTrustState = DataTrustState.EMPTY,
+    val fallbackActive: Boolean,
+    val fallbackReason: String?,
+    val symbolReports: Map<String, ForecastResult>,
+    val rollingBrierScore15m: Double,
+    val rollingBrierScore1h: Double,
+    val rollingBrierScore4h: Double,
+    val rollingEce15m: Double,
+    val rollingHitRate15m: Double,
+    val p50LatencyMs: Long,
+    val p95LatencyMs: Long,
+    val p99LatencyMs: Long
 )
 
 data class ForecastDiagnosticsSnapshot(
-    val activeModelId: String = "astra_gru_tcn_hybrid_v1_int8",
-    val activeModelVersion: String = "1.0.0-s7edge",
-    val rollbackModelId: String = "astra_logistic_l2_baseline_v1",
-    val isRollbackActive: Boolean = false,
-    val runtimeBackend: String = "CPU_INT8_COMPACT_2THREADS",
-    val cpuThreadsConfigured: Int = 2,
-    val primaryAbi: String = "arm64-v8a",
-    val bundleChecksumVerified: Boolean = false,
-    val goldenSelfTestPassed: Boolean = false,
-    val modelLoadTimeMs: Long = 0L,
-    val inferenceLatencyP50Ms: Long = 0L,
-    val inferenceLatencyP95Ms: Long = 0L,
-    val lastInferenceLatencyMs: Long = 0L,
-    val nativeHeapDeltaKb: Long = 0L,
-    val availableRamMb: Long = 0L,
-    val batteryTempCelsius: Float = 0f,
-    val thermalStatusLabel: String = "NOMINAL",
-    val throttledDueToThermalOrRam: Boolean = false,
-    val totalPredictionsGenerated: Int = 0,
-    val staleOrMissingCount: Int = 0,
-    val oodRejectedCount: Int = 0,
-    val consecutiveErrors: Int = 0,
-    val lastUpdatedMs: Long = 0L
+    val modelId: String,
+    val modelVersion: String,
+    val artifactFormat: String,
+    val schemaHash: String,
+    val operatingMode: ForecastOperatingMode,
+    val dataTrustState: DataTrustState,
+    val isHealthy: Boolean,
+    val fallbackReason: String?,
+    val rollingBrier15m: Double,
+    val rollingEce15m: Double,
+    val rollingHitRate15m: Double,
+    val featureDriftPsi: Double,
+    val oodRatePct: Double,
+    val p50LatencyMs: Long,
+    val p95LatencyMs: Long,
+    val p99LatencyMs: Long,
+    val totalInferences: Long,
+    val shadowEvaluationsCount: Int
 )
